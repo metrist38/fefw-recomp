@@ -27,6 +27,7 @@
 #include "vk_gauges.h"
 #include "vk_layer_filter.h"
 #include "video_alloc_stats.h"
+#include "video_budget_sample.h"
 #include <unordered_map>
 #include "extras/framegen.h"
 #include "extras/framegen_ffx.h"
@@ -498,28 +499,13 @@ int video_usage_percent() {
     return pct;
 }
 
-// [gfx] residency: this process' use of the budget less the room free inside VMA's blocks (what a freed image gives back stays in its
-// block for the next allocation), in percent; -1 when not known. Sampled at most every 250 ms.
-int video_live_percent() {
-    static std::atomic<int64_t> next_ms{0};
-    static std::atomic<int> last{-1};
-    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    int64_t due = next_ms.load(std::memory_order_relaxed);
-    if (now < due || !next_ms.compare_exchange_strong(due, now + 250, std::memory_order_relaxed)) return last.load(std::memory_order_relaxed);
-    int pct = -1;
-    {
-        std::lock_guard<std::timed_mutex> lk(g_guard_mu);
-        if (g_guard_vma && g_video_heap >= 0) {
-            VmaBudget b[VK_MAX_MEMORY_HEAPS] = {};
-            vmaGetHeapBudgets(g_guard_vma, b);
-            const VmaBudget& h = b[g_video_heap];
-            const uint64_t free_in_blocks = h.statistics.blockBytes > h.statistics.allocationBytes ? h.statistics.blockBytes - h.statistics.allocationBytes : 0;
-            const uint64_t live = h.usage > free_in_blocks ? h.usage - free_in_blocks : 0;
-            if (h.budget) pct = static_cast<int>(live * 100 / h.budget);
-        }
-    }
-    last.store(pct, std::memory_order_relaxed);
-    return pct;
+VideoBudgetSample video_budget_sample() {
+    std::lock_guard<std::timed_mutex> lk(g_guard_mu);
+    if (!g_guard_vma || g_video_heap < 0) return {};
+    VmaBudget b[VK_MAX_MEMORY_HEAPS] = {};
+    vmaGetHeapBudgets(g_guard_vma, b);
+    const VmaBudget& h = b[g_video_heap];
+    return {h.budget, h.usage, h.statistics.blockBytes, h.statistics.allocationBytes};
 }
 
 // ---- creation ---------------------------------------------------------------------------------------------------------
