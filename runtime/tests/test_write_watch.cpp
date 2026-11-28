@@ -354,10 +354,11 @@ NXTEST(destroy_and_recreate_while_writers_fault) {
 
 namespace {
 std::atomic<bool> delayed_entered{false}, delayed_resume{false};
+std::atomic<uint64_t> delayed_addr{0};
 LONG CALLBACK delay_write_fault(EXCEPTION_POINTERS* ep) {
     auto* e = ep->ExceptionRecord;
     if (e->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && e->NumberParameters >= 2 &&
-        e->ExceptionInformation[1] == mem::kHeapBase) {
+        e->ExceptionInformation[1] == delayed_addr.load(std::memory_order_acquire)) {
         delayed_entered.store(true);
         while (!delayed_resume.load()) YieldProcessor();
     }
@@ -368,6 +369,7 @@ NXTEST(fault_delivered_after_last_region_destroyed) {
     auto* r = setup();
     REQUIRE(r != nullptr);
     REQUIRE(ww::arm(r, 0, 1));
+    delayed_addr.store(mem::kHeapBase, std::memory_order_release);
     delayed_entered.store(false); delayed_resume.store(false);
     auto veh = AddVectoredExceptionHandler(1, delay_write_fault);
     REQUIRE(veh != nullptr);
@@ -550,5 +552,123 @@ NXTEST(import_freeze_rapid_cycles_with_concurrent_writers) {
     stop.store(true, std::memory_order_relaxed);
     for (std::thread& th : writers) th.join();
     CHECK(writes.load() > 0);
+    teardown(r);
+}
+
+NXTEST(concurrent_faults_with_overlapping_region_skip_virtual_query) {
+    mem::shutdown();
+    REQUIRE(mem::init() && mem::heap_create(kHeap) && mem::heap_commit(0, kPages * kPg));
+    // Whole-heap region published before the pool region (mirrors g_tex_ww + pool mirrors in NVN).
+    ww::Region* tex = ww::region_create(mem::kHeapBase, kHeap, "texture heap");
+    ww::Region* pool = ww::region_create(mem::kHeapBase, kPages * kPg, "pool mirror");
+    REQUIRE(tex != nullptr && pool != nullptr);
+    std::atomic<bool> stop{false};
+    std::atomic<int> failed{0};
+    const uint64_t faults0 = ww::faults();
+    const uint64_t vq0 = ww::virtual_queries();
+    std::vector<std::thread> ts;
+    for (int t = 0; t < 4; ++t)
+        ts.emplace_back([&, t] {
+            uint32_t n = static_cast<uint32_t>(t);
+            while (!stop.load(std::memory_order_relaxed)) {
+                for (uint64_t p = 0; p < 8; ++p)
+                    if (write_passes_or_faults(mem::kHeapBase + p * kPg + (n % 1024) * 4)) failed.fetch_add(1);
+                ++n;
+            }
+        });
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 3000 || (ww::faults() - faults0 < 10000 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)); ++i)
+        ww::arm(pool, 0, 8);
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& t : ts) t.join();
+    CHECK_EQ(failed.load(), 0);
+    CHECK(ww::faults() > faults0);
+    CHECK_EQ(ww::virtual_queries(), vq0);
+    ww::region_destroy(pool);
+    ww::region_destroy(tex);
+    mem::shutdown();
+}
+
+NXTEST(foreign_readonly_after_previous_release_passes_on) {
+    ww::Region* r = setup();
+    REQUIRE(r != nullptr);
+    REQUIRE(ww::arm(r, 10, 1));
+    CHECK(!write_passes_or_faults(mem::kHeapBase + 10 * kPg));   // armed page released and recorded in recent-release table
+    DWORD was = 0;
+    REQUIRE(VirtualProtect(reinterpret_cast<void*>(mem::kHeapBase + 10 * kPg), kPg, PAGE_READONLY, &was));   // foreign RO on same page
+    const uint64_t faults0 = ww::faults();
+    CHECK(write_passes_or_faults(mem::kHeapBase + 10 * kPg + 8));
+    CHECK(write_passes_or_faults(mem::kHeapBase + 10 * kPg + 16));
+    CHECK_EQ(ww::faults(), faults0);
+    CHECK_EQ(prot_of(mem::kHeapBase + 10 * kPg), static_cast<DWORD>(PAGE_READONLY));
+    teardown(r);
+}
+
+NXTEST(arm_with_concurrent_heap_epoch_bumps_avoids_virtual_query) {
+    ww::Region* r = setup();
+    REQUIRE(r != nullptr);
+    std::atomic<bool> stop{false};
+    std::thread churn([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            mem::heap_decommit(32 * kPg, 16 * kPg);
+            mem::heap_commit(32 * kPg, 16 * kPg);
+        }
+    });
+    const uint64_t vq0 = ww::virtual_queries();
+    int armed = 0;
+    for (int i = 0; i < 1000; ++i) {
+        if (ww::arm(r, 0, 8)) {
+            ++armed;
+            *reinterpret_cast<volatile uint32_t*>(mem::kHeapBase + static_cast<uint64_t>(i % 8) * kPg) = static_cast<uint32_t>(i);
+        }
+    }
+    stop.store(true, std::memory_order_relaxed);
+    churn.join();
+    CHECK(armed > 0);
+    CHECK_EQ(ww::virtual_queries(), vq0);
+    teardown(r);
+}
+
+NXTEST(delayed_writes_survive_repeated_recent_release_evictions) {
+    mem::shutdown();
+    // Use a page well above earlier tests' retired pages (e.g. region_table_grows_and_reuses_slots uses 0..1536) so
+    // g_retired is clear and evicted faults must go through heap_write_landed_late(), not retired_retry().
+    // On 4 GiB-aligned kHeapBase, pages 2048 and 3073 hash to the same recent_slot() ((2048^2)&1023 == (3073^3)&1023 == 2).
+    constexpr uint64_t kTargetPage = 2048;
+    constexpr uint64_t kCollisionPage = kTargetPage + 1025;
+    constexpr uint64_t kTestPages = kCollisionPage + 1;
+    const uint64_t target_addr = mem::kHeapBase + kTargetPage * kPg;
+    REQUIRE(mem::init() && mem::heap_create(kHeap) && mem::heap_commit(0, kTestPages * kPg));
+    REQUIRE(ww::describe_page(target_addr).find("retired-page history=1") == std::string::npos);
+    ww::Region* r = ww::region_create(mem::kHeapBase, kTestPages * kPg);
+    REQUIRE(r != nullptr);
+    delayed_addr.store(target_addr, std::memory_order_release);
+    auto veh = AddVectoredExceptionHandler(1, delay_write_fault);
+    REQUIRE(veh != nullptr);
+    std::atomic<int> round{0}, done{0}, failed{0};
+    constexpr int kRounds = 12;   // exceeds heap_write_landed_late's 8-visit stuck-fault cap
+    std::thread writer([&] {
+        for (int i = 1; i <= kRounds; ++i) {
+            while (round.load(std::memory_order_acquire) != i) YieldProcessor();
+            if (write_passes_or_faults(target_addr)) failed.fetch_add(1, std::memory_order_relaxed);
+            done.store(i, std::memory_order_release);
+        }
+    });
+    for (int i = 1; i <= kRounds; ++i) {
+        REQUIRE(ww::arm(r, kTargetPage, 1));
+        REQUIRE(ww::arm(r, kCollisionPage, 1));
+        delayed_entered.store(false, std::memory_order_relaxed);
+        delayed_resume.store(false, std::memory_order_relaxed);
+        round.store(i, std::memory_order_release);
+        while (!delayed_entered.load(std::memory_order_acquire)) YieldProcessor();
+        // Release target page, then release the colliding page to evict target page from g_recent_rel before writer resumes.
+        *reinterpret_cast<volatile uint32_t*>(target_addr + 4) = static_cast<uint32_t>(i);
+        *reinterpret_cast<volatile uint32_t*>(mem::kHeapBase + kCollisionPage * kPg) = static_cast<uint32_t>(i);
+        delayed_resume.store(true, std::memory_order_release);
+        while (done.load(std::memory_order_acquire) != i) YieldProcessor();
+    }
+    writer.join();
+    RemoveVectoredExceptionHandler(veh);
+    CHECK_EQ(failed.load(), 0);
     teardown(r);
 }
