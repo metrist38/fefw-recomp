@@ -39,6 +39,7 @@
 #include "nxrt/kernel.h"
 #include "nxrt/svc.h"
 #include "nxrt/config.h"
+#include "nxrt/diag.h"
 #include "nxrt/jc2_mouse.h"
 #include "nxrt/dispatch.h"
 #include "nxrt/hooks.h"
@@ -819,7 +820,7 @@ int update_hook(::Ctx*, uint64_t, void*) {
     if (st.window && on_pump_thread) platform::pump_events();
 
     // settings queued by the page
-    {
+    auto apply_pending_settings = [&](uint64_t ts_now) {
         std::unique_lock<std::mutex> lk(st.mu);
         if (st.have_pending) {
             Settings s = st.pending;
@@ -830,7 +831,7 @@ int update_hook(::Ctx*, uint64_t, void*) {
             st.settings = s;
             st.settings_epoch++;
             lk.unlock();
-            st.engine->set_settings(s, now);
+            st.engine->set_settings(s, ts_now);
             apply_frame_cap(s);
             display_tuning(s.display);
             if (const GamePlay* gp = game_play(); gp && gp->settings_changed) gp->settings_changed(s);     // the game's display options, lock-on
@@ -856,7 +857,8 @@ int update_hook(::Ctx*, uint64_t, void*) {
             if (!save_settings(st.path, s, &err)) NXLOG_W(kTag, "cannot save %s: %s", st.path.c_str(), err.c_str());
             else NXLOG_I(kTag, "settings applied and saved to %s", st.path.c_str());
         }
-    }
+    };
+    apply_pending_settings(now);
 
     apply_unfocused_mute();
 
@@ -920,6 +922,74 @@ int update_hook(::Ctx*, uint64_t, void*) {
     const bool overlay_visible = st.overlay && st.overlay->blocks_game();
     if (overlay_visible && !st.overlay_was_visible) st.engine->release_all(now);
     st.overlay_was_visible = overlay_visible;
+
+    // External pause signal (e.g. Decky plugin watching Steam Game Mode focus / QAM / Steam menu / sleep).
+    // Checked at most every 40 ms so normal gameplay pays near-zero cost.
+    static const std::string ext_pause_path = [] {
+        const char* env = std::getenv("NXRT_PAUSE_FILE");
+        return (env && *env) ? std::string(env) : std::string("Z:\\tmp\\fefw-recomp-pause");
+    }();
+    auto external_pause_active = [&](bool force) {
+        static uint64_t last_check_ms = 0;
+        static bool cached = false;
+        const uint64_t t_ms = SDL_GetTicks();
+        if (force || t_ms - last_check_ms >= 40) {
+            last_check_ms = t_ms;
+            cached = GetFileAttributesA(ext_pause_path.c_str()) != INVALID_FILE_ATTRIBUTES;
+        }
+        return cached;
+    };
+    auto should_pause = [&](bool force_ext) {
+        const bool ov = st.overlay && st.overlay->blocks_game();
+        const bool unfoc = st.window && !platform::focused();
+        const bool ext = st.window && st.settings.fastboot.pause_unfocused && external_pause_active(force_ext);
+        return (ov && st.settings.fastboot.pause_in_menu) || (unfoc && st.settings.fastboot.pause_unfocused) || ext;
+    };
+    if (should_pause(false)) {
+        const bool unfoc_start = st.window && !platform::focused();
+        const bool ext_start = st.window && st.settings.fastboot.pause_unfocused && external_pause_active(false);
+        NXLOG_I(kTag, "pause: entering runtime pause (%s)",
+                overlay_visible ? "F1 menu open" : (ext_start ? "Steam menu / external" : (unfoc_start ? "window unfocused" : "other")));
+        st.engine->release_all(now);
+        kernel::set_paused(true, GetCurrentThreadId());
+        audio::set_paused(true);
+        st.limiter.reset_schedule();
+        if (st.window) {
+            if (platform::relative_mouse()) platform::set_relative_mouse(false);
+            platform::set_cursor_visible(true);
+        }
+        uint64_t last_present_ms = 0;
+        while (should_pause(true)) {
+            const uint64_t pnow = now_ns();
+            if (st.window && on_pump_thread) {
+                platform::pump_events();
+                g_last_pump_ms.store(SDL_GetTicks(), std::memory_order_relaxed);
+                platform::set_text_input(st.overlay && st.overlay->keyboard_open());
+                if (platform::relative_mouse()) platform::set_relative_mouse(false);
+                platform::set_cursor_visible(true);
+            }
+            apply_pending_settings(pnow);
+            input::Event pbuf[64];
+            for (;;) {
+                const size_t got = input::queue_drain(pbuf, 64);
+                if (!got) break;
+                for (size_t i = 0; i < got; ++i) handle_event(pbuf[i], pnow);
+            }
+            if (st.overlay && st.overlay->blocks_game()) poll_pads(pnow);
+            const uint64_t t_ms = SDL_GetTicks();
+            if (t_ms - last_present_ms >= 16) {
+                last_present_ms = t_ms;
+                if (st.window && platform::minimized()) diag_frame_tick();
+                else nvn::present_last_frame_again();
+            }
+            Sleep(4);
+        }
+        st.overlay_was_visible = st.overlay && st.overlay->blocks_game();
+        audio::set_paused(false);
+        kernel::set_paused(false);
+        st.limiter.reset_schedule();
+        NXLOG_I(kTag, "pause: resumed");
+    }
 
     if (st.window) {
         platform::set_text_input(st.overlay && st.overlay->keyboard_open());   // typed text for the on-screen keyboard only

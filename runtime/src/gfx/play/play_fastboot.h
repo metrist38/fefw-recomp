@@ -21,6 +21,8 @@ struct FastbootSettings {
     int menu_speed = 2;             // [tweaks] menu_speed, 1..4; read only while fast_menus is on
     std::string language;           // [tweaks] language: a language name (AmericanEnglish, French, ...) or "" = auto (the Windows language).
                                     // Read by the settings service at start-up (services/common.cpp); a change applies at the next start.
+    bool pause_in_menu = false;     // [tweaks] pause_in_menu: freeze the game, cutscenes, movies and audio while the F1 menu is open
+    bool pause_unfocused = true;    // [tweaks] pause_unfocused: freeze the game, cutscenes, movies and audio while the window is not in focus
 };
 
 // One `key = value` of the [tweaks] section. Returns false with *msg set for a bad value of one of these keys. *known is false (and the

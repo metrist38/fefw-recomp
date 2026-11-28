@@ -118,6 +118,8 @@ public:
         return s;
     }
 
+    void set_paused(bool paused) override { inner_->set_paused(paused); }
+
 private:
     struct Job {
         enum Kind { Open, Data, Close } kind = Data;

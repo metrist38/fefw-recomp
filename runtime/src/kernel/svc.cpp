@@ -189,6 +189,7 @@ struct GameSvcTimer {
 void svc_set_busy_hook(void (*fn)()) { g_busy_hook.store(fn, std::memory_order_release); }
 
 void svc_dispatch(::Ctx* c, uint32_t number, uint64_t pc) {
+    if (kernel::is_paused()) kernel::wait_if_paused();
     GameSvcTimer game_timer(number);
     if (kernel::KThread* self = kernel::current_thread()) self->last_proc.store(static_cast<int>(GetCurrentProcessorNumber()), std::memory_order_relaxed);   // the starvation line
     if (auto fn = g_busy_hook.load(std::memory_order_relaxed)) fn();
@@ -207,6 +208,7 @@ void svc_dispatch(::Ctx* c, uint32_t number, uint64_t pc) {
         const uint64_t t1 = ft::now_ns();
         if (t1 - t0 >= 20000) wait_site_record(c, number, req, t0, t1);
         if (ft::on() && t1 - t0 >= 100000) { static const uint16_t z = ft::zone_id("svc"); ft::event(z, t0, t1, number); }
+        if (kernel::is_paused()) kernel::wait_if_paused();
         return;
     }
     if (ft::on()) {
@@ -214,9 +216,11 @@ void svc_dispatch(::Ctx* c, uint32_t number, uint64_t pc) {
         h(c);
         const uint64_t t1 = ft::now_ns();
         if (t1 - t0 >= 100000) { static const uint16_t z = ft::zone_id("svc"); ft::event(z, t0, t1, number); }
+        if (kernel::is_paused()) kernel::wait_if_paused();
         return;
     }
     h(c);
+    if (kernel::is_paused()) kernel::wait_if_paused();
 }
 
 std::vector<SvcUnknownRecord> svc_unknown_records() {

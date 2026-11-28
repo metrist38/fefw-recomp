@@ -43,6 +43,8 @@ public:
     virtual const char* name() const = 0;
     // The counters above. The base class has no write path of its own, so by default it reports zeros.
     virtual SinkStats stats() { return {}; }
+    // Pauses or resumes host playback without flushing queued buffers.
+    virtual void set_paused(bool) {}
 };
 
 // The null sink: accepts everything, plays nothing, reports an empty queue. Counts frames for tests.
@@ -125,6 +127,8 @@ float master_volume();
 void set_muted(bool muted);
 bool muted();
 float effective_volume();
+void set_paused(bool paused);
+bool paused();
 constexpr float kMaxVolume = 2.0f;   // 200%
 
 // The boost above 100%: multiplies interleaved int16 PCM in place by boost (> 1) under a peak limiter (no lookahead: the gain drops at

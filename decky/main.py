@@ -8,8 +8,24 @@ import decky
 import fefw_launcher
 
 
+PAUSE_FLAG_PATH = "/tmp/fefw-recomp-pause"
+
+
+def _set_pause_flag(paused: bool):
+    try:
+        if paused:
+            with open(PAUSE_FLAG_PATH, "w", encoding="utf-8") as f:
+                f.write("1\n")
+            os.chmod(PAUSE_FLAG_PATH, 0o644)
+        elif os.path.exists(PAUSE_FLAG_PATH):
+            os.unlink(PAUSE_FLAG_PATH)
+    except OSError as e:
+        decky.logger.warning("pause flag update failed: %s", e)
+
+
 class Plugin:
     async def _main(self):
+        _set_pause_flag(False)
         async def done(result):
             decky.logger.info("job ended: %s", result)
             await decky.emit("fefw_job_done", result)
@@ -19,6 +35,7 @@ class Plugin:
             plugin_version=decky.DECKY_PLUGIN_VERSION, data_dir=decky.DECKY_PLUGIN_RUNTIME_DIR)
 
     async def _unload(self):
+        _set_pause_flag(False)
         await self.controller.close()
 
     def _answer(self, action=None):
@@ -75,3 +92,6 @@ class Plugin:
 
     async def cancel(self):
         return self._answer(self.controller.cancel)
+
+    async def set_game_paused(self, paused: bool):
+        _set_pause_flag(bool(paused))

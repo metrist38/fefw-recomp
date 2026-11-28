@@ -1368,6 +1368,16 @@ void game_page(UiHost& host, Menu& m) {
         }
         end_rows();
     }
+    section("Pause");
+    if (begin_rows("pause")) {
+        row(m, "Pause while this menu is open", When::Live,
+            "Freezes the game, cutscenes, movies and audio while the F1 menu is open. [tweaks] pause_in_menu in controls.ini.");
+        if (check(m, "##pause_menu", &m.edit.fastboot.pause_in_menu)) apply(host, m);
+        row(m, "Pause in the background", When::Live,
+            "Freezes the game, cutscenes, movies and audio while the window is not in focus (Alt+Tab, Steam menu, Quick Access). [tweaks] pause_unfocused in controls.ini.");
+        if (check(m, "##pause_bg", &m.edit.fastboot.pause_unfocused)) apply(host, m);
+        end_rows();
+    }
     section("Movies");
     if (begin_rows("mov")) {
         constexpr const char* kNames[] = {"Play them (AV1 on the CPU)", "Skip them"};

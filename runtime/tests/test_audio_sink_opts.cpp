@@ -262,3 +262,39 @@ NXTEST(list_output_devices_does_not_crash) {
     CHECK(first.size() < 4096);
     CHECK(second.size() < 4096);
 }
+
+
+NXTEST(pause_propagates_to_sink_and_wav_tee) {
+    struct SpySink final : nxrt::audio::AudioSink {
+        bool open(uint32_t, uint32_t) override { return true; }
+        void close() override {}
+        uint32_t write(const int16_t*, uint32_t frames) override { return frames; }
+        uint32_t queued_frames() override { return 0; }
+        const char* name() const override { return "spy"; }
+        void set_paused(bool p) override {
+            paused_state = p;
+            calls++;
+        }
+        bool paused_state = false;
+        int calls = 0;
+    };
+    const std::string path = temp_wav("pause_tee");
+    std::filesystem::remove(path);
+    auto spy = std::make_shared<SpySink>();
+    auto tee = nxrt::audio::make_wav_tee(spy, path);
+    nxrt::audio::set_sink(tee);
+
+    CHECK(!nxrt::audio::paused());
+    nxrt::audio::set_paused(true);
+    CHECK(nxrt::audio::paused());
+    CHECK(spy->paused_state);
+    CHECK_EQ(spy->calls, 1);
+
+    nxrt::audio::set_paused(false);
+    CHECK(!nxrt::audio::paused());
+    CHECK(!spy->paused_state);
+    CHECK_EQ(spy->calls, 2);
+
+    nxrt::audio::set_sink(std::make_shared<nxrt::audio::NullSink>());
+    std::filesystem::remove(path);
+}

@@ -6,6 +6,8 @@
 // 0x70C74, TimeZoneConversionFailed (903) = 0x70E74, TimeZoneNotFound (989) = 0x7BA74.
 // Tests whose name ends in `_needs_tz` depend on src/services/timezone.cpp (tz::to_calendar / tz::to_posix); on a branch where that
 // file is still the placeholder they fail for that reason only.
+#include <windows.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -659,4 +661,38 @@ NXTEST(svc_time_operation_event_handles) {
     nxsvc::Reply tev = zone.call(20);                   // GetDeviceLocationNameOperationEventReadableHandle
     REQUIRE(tev.ok());
     CHECK_EQ(tev.copy.size(), 1u);
+}
+
+
+NXTEST(kernel_pause_freezes_system_tick_and_blocks_other_threads) {
+    CHECK(!kernel::is_paused());
+    kernel::set_paused(true, GetCurrentThreadId());
+    CHECK(kernel::is_paused());
+
+    // Owner thread never blocks in wait_if_paused().
+    kernel::wait_if_paused();
+
+    const uint64_t t_frozen_1 = kernel::system_tick();
+    std::atomic<bool> worker_entered{false};
+    std::atomic<bool> worker_resumed{false};
+    std::thread worker([&] {
+        worker_entered.store(true, std::memory_order_release);
+        kernel::wait_if_paused();
+        worker_resumed.store(true, std::memory_order_release);
+    });
+    while (!worker_entered.load(std::memory_order_acquire)) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    const uint64_t t_frozen_2 = kernel::system_tick();
+    CHECK_EQ(t_frozen_1, t_frozen_2);
+    CHECK(!worker_resumed.load(std::memory_order_acquire));
+
+    kernel::set_paused(false);
+    CHECK(!kernel::is_paused());
+    worker.join();
+    CHECK(worker_resumed.load(std::memory_order_acquire));
+
+    // After unpausing, system_tick() must not have jumped by the 60 ms pause duration.
+    const uint64_t t_after = kernel::system_tick();
+    const uint64_t delta_ms = (t_after - t_frozen_1) * 1000ull / kernel::tick_hz();
+    CHECK(delta_ms < 40);
 }

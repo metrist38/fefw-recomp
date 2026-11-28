@@ -9,6 +9,54 @@
 
 namespace nxrt::kernel {
 
+namespace {
+std::atomic<bool> g_paused{false};
+std::atomic<uint32_t> g_pause_owner_tid{0};
+std::atomic<uint64_t> g_paused_qpc_total{0};
+std::atomic<uint64_t> g_pause_start_qpc{0};
+SRWLOCK g_pause_lock = SRWLOCK_INIT;
+CONDITION_VARIABLE g_pause_cv = CONDITION_VARIABLE_INIT;
+
+uint64_t raw_qpc() {
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return static_cast<uint64_t>(c.QuadPart);
+}
+}  // namespace
+
+void set_paused(bool paused, uint32_t owner_tid) {
+    AcquireSRWLockExclusive(&g_pause_lock);
+    const bool was = g_paused.load(std::memory_order_relaxed);
+    if (paused && !was) {
+        g_pause_start_qpc.store(raw_qpc(), std::memory_order_relaxed);
+        g_pause_owner_tid.store(owner_tid, std::memory_order_relaxed);
+        g_paused.store(true, std::memory_order_release);
+    } else if (!paused && was) {
+        const uint64_t now = raw_qpc();
+        const uint64_t start = g_pause_start_qpc.load(std::memory_order_relaxed);
+        if (now > start) {
+            g_paused_qpc_total.fetch_add(now - start, std::memory_order_relaxed);
+        }
+        g_pause_owner_tid.store(0, std::memory_order_relaxed);
+        g_paused.store(false, std::memory_order_release);
+        WakeAllConditionVariable(&g_pause_cv);
+    }
+    ReleaseSRWLockExclusive(&g_pause_lock);
+}
+
+bool is_paused() { return g_paused.load(std::memory_order_acquire); }
+
+void wait_if_paused() {
+    if (!g_paused.load(std::memory_order_acquire)) return;
+    const uint32_t owner = g_pause_owner_tid.load(std::memory_order_relaxed);
+    if (owner != 0 && GetCurrentThreadId() == owner) return;
+    AcquireSRWLockExclusive(&g_pause_lock);
+    while (g_paused.load(std::memory_order_acquire)) {
+        SleepConditionVariableSRW(&g_pause_cv, &g_pause_lock, INFINITE, 0);
+    }
+    ReleaseSRWLockExclusive(&g_pause_lock);
+}
+
 uint64_t tick_hz() {
     static const uint64_t hz = game::info().platform == game::Platform::Switch2 ? kTickHzSwitch2 : kTickHzSwitch1;
     return hz;
@@ -21,9 +69,18 @@ uint64_t system_tick() {
         QueryPerformanceFrequency(&f);
         return static_cast<uint64_t>(f.QuadPart);
     }();
-    LARGE_INTEGER c;
-    QueryPerformanceCounter(&c);
-    const uint64_t v = static_cast<uint64_t>(c.QuadPart);
+    uint64_t v = 0;
+    if (!g_paused.load(std::memory_order_acquire)) {
+        const uint64_t q = raw_qpc();
+        const uint64_t off = g_paused_qpc_total.load(std::memory_order_relaxed);
+        v = q > off ? q - off : 0;
+    } else {
+        AcquireSRWLockShared(&g_pause_lock);
+        const uint64_t q = g_paused.load(std::memory_order_relaxed) ? g_pause_start_qpc.load(std::memory_order_relaxed) : raw_qpc();
+        const uint64_t off = g_paused_qpc_total.load(std::memory_order_relaxed);
+        v = q > off ? q - off : 0;
+        ReleaseSRWLockShared(&g_pause_lock);
+    }
     const uint64_t hz = tick_hz();
     return (v / freq) * hz + (v % freq) * hz / freq;     // split so the multiplication cannot overflow
 }
