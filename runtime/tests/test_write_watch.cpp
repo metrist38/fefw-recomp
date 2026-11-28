@@ -626,3 +626,40 @@ NXTEST(arm_with_concurrent_heap_epoch_bumps_avoids_virtual_query) {
     CHECK_EQ(ww::virtual_queries(), vq0);
     teardown(r);
 }
+
+NXTEST(delayed_writes_survive_repeated_recent_release_evictions) {
+    mem::shutdown();
+    constexpr uint64_t kCollisionPage = 1025;   // shares recent_slot() with page 0 on 4 GiB-aligned kHeapBase
+    constexpr uint64_t kTestPages = kCollisionPage + 1;
+    REQUIRE(mem::init() && mem::heap_create(kHeap) && mem::heap_commit(0, kTestPages * kPg));
+    ww::Region* r = ww::region_create(mem::kHeapBase, kTestPages * kPg);
+    REQUIRE(r != nullptr);
+    auto veh = AddVectoredExceptionHandler(1, delay_write_fault);
+    REQUIRE(veh != nullptr);
+    std::atomic<int> round{0}, done{0}, failed{0};
+    constexpr int kRounds = 12;   // exceeds heap_write_landed_late's 8-visit stuck-fault cap
+    std::thread writer([&] {
+        for (int i = 1; i <= kRounds; ++i) {
+            while (round.load(std::memory_order_acquire) != i) YieldProcessor();
+            if (write_passes_or_faults(mem::kHeapBase)) failed.fetch_add(1, std::memory_order_relaxed);
+            done.store(i, std::memory_order_release);
+        }
+    });
+    for (int i = 1; i <= kRounds; ++i) {
+        REQUIRE(ww::arm(r, 0, 1));
+        REQUIRE(ww::arm(r, kCollisionPage, 1));
+        delayed_entered.store(false, std::memory_order_relaxed);
+        delayed_resume.store(false, std::memory_order_relaxed);
+        round.store(i, std::memory_order_release);
+        while (!delayed_entered.load(std::memory_order_acquire)) YieldProcessor();
+        // Release page 0, then release the colliding page to evict page 0 from g_recent_rel before writer resumes.
+        *reinterpret_cast<volatile uint32_t*>(mem::kHeapBase + 4) = static_cast<uint32_t>(i);
+        *reinterpret_cast<volatile uint32_t*>(mem::kHeapBase + kCollisionPage * kPg) = static_cast<uint32_t>(i);
+        delayed_resume.store(true, std::memory_order_release);
+        while (done.load(std::memory_order_acquire) != i) YieldProcessor();
+    }
+    writer.join();
+    RemoveVectoredExceptionHandler(veh);
+    CHECK_EQ(failed.load(), 0);
+    teardown(r);
+}

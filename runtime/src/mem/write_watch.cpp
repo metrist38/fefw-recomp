@@ -112,6 +112,7 @@ std::atomic<uint64_t> g_faults{0};
 std::atomic<uint64_t> g_write_seq{0};  // bumped after any region sets written[] + has_written
 std::atomic<uint64_t> g_waits{0};      // rounds a fault waited for another releaser (statistics, tests)
 std::atomic<uint64_t> g_release_fails{0};    // bumped before releasing-- if a release's VirtualProtect did not make the page RW
+std::atomic<uint64_t> g_release_seq{0};      // bumped after any VirtualProtect(..., PAGE_READWRITE) release succeeds
 std::atomic<uint64_t> g_virtual_queries{0};  // VirtualQuery calls made by fault/arm/freeze slow paths (statistics, tests)
 std::atomic<uint64_t> g_guard_faults{0};   // accesses that hit a guarded page
 std::atomic<GuardHandler> g_guard_fn{nullptr};
@@ -279,18 +280,24 @@ int final_retry(uint64_t addr, ULONG_PTR kind, uint64_t generation) {
 std::atomic<uint64_t> g_late_retries{0};
 bool heap_write_landed_late(uint64_t addr) {
     if (addr < kHeapBase || addr - kHeapBase >= kHeapMax) return false;
-    thread_local uint64_t t_page = 0;
-    thread_local int t_count = 0;
-    const uint64_t pg = addr & ~(kPage - 1);
-    if (pg != t_page) {
-        t_page = pg;
-        t_count = 0;
-    }
-    if (++t_count > 8) return false;
     const DWORD pr = page_protect(addr);
     if (pr & PAGE_GUARD) return false;
     const DWORD p = pr & 0xff;
     if (p != PAGE_READWRITE && p != PAGE_EXECUTE_READWRITE) return false;
+    // Reset the per-thread consecutive-retry bound whenever the page changes or any write-watch/freeze release occurred
+    // since the last visit: repeated g_recent_rel evictions across separate successful writes must not exhaust the bound,
+    // while a stuck fault that keeps re-faulting on an already-RW page with no intervening release still reports.
+    thread_local uint64_t t_page = 0;
+    thread_local uint64_t t_seq = 0;
+    thread_local int t_count = 0;
+    const uint64_t pg = addr & ~(kPage - 1);
+    const uint64_t seq = g_release_seq.load(std::memory_order_acquire);
+    if (pg != t_page || seq != t_seq) {
+        t_page = pg;
+        t_seq = seq;
+        t_count = 0;
+    }
+    if (++t_count > 8) return false;
     if (g_late_retries.fetch_add(1, std::memory_order_relaxed) == 0)
         NXLOG_W(kTag, "write fault at %llx on a page that is read-write again (an import freeze ended meanwhile): the write runs again",
                 static_cast<unsigned long long>(addr));
@@ -324,8 +331,12 @@ bool release_page(Region* r, uint64_t page) {
             VirtualProtect(reinterpret_cast<void*>(addr), kPage, was, &tmp);
             ok = false;
         }
-        if (ok) record_recent_release(addr);
-        else g_release_fails.fetch_add(1, std::memory_order_seq_cst);
+        if (ok) {
+            g_release_seq.fetch_add(1, std::memory_order_release);
+            record_recent_release(addr);
+        } else {
+            g_release_fails.fetch_add(1, std::memory_order_seq_cst);
+        }
         rel.fetch_sub(1, std::memory_order_seq_cst);
         return ok;
     }
@@ -375,6 +386,7 @@ uint64_t release_pages_ahead(Region* r, uint64_t start_page, uint64_t max_count)
         DWORD was = 0;
         const bool ok = VirtualProtect(reinterpret_cast<void*>(r->base + start_page * kPage), static_cast<SIZE_T>(claimed * kPage), PAGE_READWRITE, &was) != 0;
         if (ok) {
+            g_release_seq.fetch_add(1, std::memory_order_release);
             for (uint64_t i = 0; i < claimed; ++i) record_recent_release(r->base + (start_page + i) * kPage);
         } else {
             g_release_fails.fetch_add(1, std::memory_order_seq_cst);
@@ -570,6 +582,7 @@ retry:
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         ours = decision == 1;
+        if (ours) tl_fast_val = 0;
         if (decision == -1) {
             g_busy.fetch_sub(1, std::memory_order_seq_cst);
             goto retry; // a replacement region may now own the protection
@@ -701,13 +714,17 @@ void region_destroy(Region* r) {
         uint64_t q = p;
         while (q < r->npages && held(q)) ++q;
         set_bits(g_retired, (r->base - kHeapBase) / kPage + p, q - p, true);
-        set_bits(r->prot.get(), p, q - p, false);
-        set_bits(r->guard.get(), p, q - p, false);
+        // Restore PAGE_READWRITE (and record the release) before clearing prot/guard: on_fault's pass-0 pre-check reads
+        // prot/guard without taking r->lock, so a writer that sees both clear must already find the page writable.
         DWORD was = 0;
-        if (VirtualProtect(reinterpret_cast<void*>(r->base + p * kPage), static_cast<SIZE_T>((q - p) * kPage), PAGE_READWRITE, &was) &&
-            q - p <= kRecentRelMask + 1) {
-            for (uint64_t i = p; i < q; ++i) record_recent_release(r->base + i * kPage);
+        if (VirtualProtect(reinterpret_cast<void*>(r->base + p * kPage), static_cast<SIZE_T>((q - p) * kPage), PAGE_READWRITE, &was)) {
+            g_release_seq.fetch_add(1, std::memory_order_release);
+            if (q - p <= kRecentRelMask + 1) {
+                for (uint64_t i = p; i < q; ++i) record_recent_release(r->base + i * kPage);
+            }
         }
+        set_bits(r->guard.get(), p, q - p, false);
+        set_bits(r->prot.get(), p, q - p, false);
         p = q;
     }
     }
@@ -1073,9 +1090,11 @@ ImportFreeze::~ImportFreeze() {
     AcquireSRWLockExclusive(&g_transitions);
     for (const auto& r : runs_) {
         DWORD was = 0;
-        if (VirtualProtect(reinterpret_cast<void*>(r.first), static_cast<SIZE_T>(r.second - r.first), PAGE_READWRITE, &was) &&
-            (r.second - r.first) / kPage <= kRecentRelMask + 1) {
-            for (uint64_t a = r.first; a < r.second; a += kPage) record_recent_release(a);
+        if (VirtualProtect(reinterpret_cast<void*>(r.first), static_cast<SIZE_T>(r.second - r.first), PAGE_READWRITE, &was)) {
+            g_release_seq.fetch_add(1, std::memory_order_release);
+            if ((r.second - r.first) / kPage <= kRecentRelMask + 1) {
+                for (uint64_t a = r.first; a < r.second; a += kPage) record_recent_release(a);
+            }
         }
     }
     ReleaseSRWLockExclusive(&g_transitions);
