@@ -7,13 +7,11 @@ import { t, initLang, getLang } from './i18n.js';
 import { languageButton } from './languageMenu.js';
 import * as play from './pages/play.js';
 import * as settings from './pages/settings.js';
-import * as setup from './pages/setup.js';
 import * as about from './pages/about.js';
 import { upd, notify, checkNow, available } from './update.js';
 
 const PAGES = {
   play: { mod: play, key: 'nav.play', icon: 'play' },
-  setup: { mod: setup, key: 'nav.setup', icon: 'hammer' },
   settings: { mod: settings, key: 'nav.settings', icon: 'settings' },
   about: { mod: about, key: 'nav.about', icon: 'info' },
 };
@@ -108,8 +106,7 @@ async function boot() {
   }
   await initLang(() => redrawForLang());
   drawShell();
-  // first run: no game files chosen yet
-  go(cfg.dump_dir ? 'play' : 'setup', { firstRun: !cfg.dump_dir });
+  go('play', { firstRun: !cfg.dump_dir });
   if (!cfg.skip_update_check) checkNow(); // quietly: a failure only shows on the About page
 }
 
