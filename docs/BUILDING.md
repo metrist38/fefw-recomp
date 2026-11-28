@@ -19,8 +19,7 @@ npm install
 npm run tauri build -- --no-bundle
 ```
 
-Start `launcher\src-tauri\target\release\fefw-launcher.exe`. Built inside a checkout, it works on that checkout: the Setup page lists
-which build tools it found and runs, in order, with the log on screen:
+Start `launcher\src-tauri\target\release\fefw-launcher.exe`. Built inside a checkout, it works on that checkout: the **Set up & build** card on Play flags any missing build tools and runs, in order, with the log on screen:
 
 1. the Python environment (`tools\.venv`)
 2. the game code from your dump: `game\dump\exefs` (the console's `main` is ZBIC-compressed and is written uncompressed)

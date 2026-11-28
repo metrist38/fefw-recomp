@@ -5,7 +5,7 @@ decrypted dump of the game (update 131072), as a folder with exefs/ and romfs/ o
 
 fefw.exe is a Windows program: the launcher builds it on this PC and starts it through Proton (Steam's own, else umu-run) or Wine.
 
-1. Run fefw-launcher.AppImage (chmod +x it if your file manager did not keep the bit) and pick your dump (Setup page).
+1. Run fefw-launcher.AppImage (chmod +x it if your file manager did not keep the bit) and pick your dump.
 2. Press Set up. It checks your dump, recompiles the game code into fefw.exe and translates the shaders, with the tools in
    tools/. Nothing else needs to be installed for that. The first run takes a while; you can pause and continue later.
 3. Press Play. This needs Steam with a Proton installed, umu-launcher (umu-run) or Wine; Settings > Runner sets another command.

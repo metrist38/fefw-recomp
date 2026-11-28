@@ -37,7 +37,7 @@ machines, unless they edited it (see `locales/README.md`).
   "name": "Deutsch",
   "strings": {
     "nav.play": "Spielen",
-    "nav.setup": "Einrichten"
+    "nav.settings": "Einstellungen"
   }
 }
 ```

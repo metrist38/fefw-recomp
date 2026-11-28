@@ -23,7 +23,7 @@ software and draws with Vulkan. It is not an emulator. It also runs on Linux and
 
 <p>
 <img src="docs/screenshots/launcher-play.png" alt="The launcher's Play page, with the game ready to start" width="32%">
-<img src="docs/screenshots/launcher-setup.png" alt="The Setup page while the game is being built" width="32%">
+<img src="docs/screenshots/launcher-setup.png" alt="The Play page while the game is being built" width="32%">
 <img src="docs/screenshots/launcher-settings.png" alt="The graphics settings: preset, upscaling and frame generation" width="32%">
 </p>
 
@@ -180,7 +180,7 @@ display language and uses English when the game has no translation for it. The c
 
 - **"These game files are a different version"**: only update 131072 is supported. Check that you dumped the update, not only the
   base game.
-- **Setup stopped or failed**: press **Set up** again to continue where it stopped. **Open full log** on the Setup page shows what
+- **Setup stopped or failed**: press **Set up** again to continue where it stopped. **Open full log** in the **Set up & build** card shows what
   went wrong.
 - **The game closes or freezes**: look at `fefw.log` in the launcher's folder, and update your GPU driver.
 

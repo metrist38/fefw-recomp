@@ -51,7 +51,7 @@ const windowHtml = (shot) => `<!doctype html>
  */
 const SHOTS = [
   { file: 'launcher-play.png', scenario: 'ready', ready: '#play:enabled' },
-  { file: 'launcher-setup.png', scenario: 'building', click: ['[data-page="setup"]'], ready: '#steps-card progress', scrollTo: '#steps-card' },
+  { file: 'launcher-setup.png', scenario: 'building', ready: '#setup-card progress', scrollTo: '#setup-card' },
   {
     file: 'launcher-settings.png',
     scenario: 'ready',
