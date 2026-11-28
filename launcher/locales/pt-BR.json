@@ -284,7 +284,7 @@
     "settings.astcBc.bc1": "Compacto (BC1)",
     "settings.gpu.label": "Placa de vídeo",
     "settings.gpu.short": "Qual GPU desenha o jogo.",
-    "settings.gpu.hint": "Num PC com duas placas de vídeo, escolha a GPU integrada para deixar a placa dedicada parada e economizar energia. Ela é mais lenta, então baixe a resolução se a taxa de quadros cair. Uma placa que não consegue rodar o jogo é ignorada. Para escolher uma placa pelo nome, defina-a no menu F1 do jogo. Depois de mudar, abra Preparação e clique em Verificar de novo para que os shaders sejam preparados para essa placa. Uma linha [gfx] gpu no fefw.ini ou a variável NXRT_GFX_GPU tem prioridade sobre esta opção.",
+    "settings.gpu.hint": "Num PC com duas placas de vídeo, escolha a GPU integrada para deixar a placa dedicada parada e economizar energia. Ela é mais lenta, então baixe a resolução se a taxa de quadros cair. Uma placa que não consegue rodar o jogo é ignorada. Para escolher uma placa pelo nome, defina-a no menu F1 do jogo. Depois de mudar, abra Recompilar / Alterar arquivos em Jogar e clique em Verificar de novo para que os shaders sejam preparados para essa placa. Uma linha [gfx] gpu no fefw.ini ou a variável NXRT_GFX_GPU tem prioridade sobre esta opção.",
     "settings.gpu.auto": "Automático (GPU dedicada com mais memória de vídeo)",
     "settings.gpu.discrete": "GPU dedicada",
     "settings.gpu.integrated": "GPU integrada (economiza energia)",

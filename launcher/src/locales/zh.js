@@ -489,7 +489,7 @@ export const zh = {
   'settings.astcBc.off': '关闭',
   'settings.gpu.label': '显卡',
   'settings.gpu.short': '选择由哪块 GPU 渲染游戏。',
-  'settings.gpu.hint': '在有两块显卡的电脑上，选择核显可让独显闲置、降低功耗。核显较慢，帧率下降时请降低分辨率。无法运行游戏的显卡会被跳过。如需按名称选择显卡，请在游戏内的 F1 菜单中设置。更改后请打开「构建」页并按「重新检查」，以便为该显卡准备着色器。fefw.ini 中的 [gfx] gpu 或环境变量 NXRT_GFX_GPU 会覆盖此设置。',
+  'settings.gpu.hint': '在有两块显卡的电脑上，选择核显可让独显闲置、降低功耗。核显较慢，帧率下降时请降低分辨率。无法运行游戏的显卡会被跳过。如需按名称选择显卡，请在游戏内的 F1 菜单中设置。更改后请打开「游玩」页中的「重新构建 / 更换文件」并按「重新检查」，以便为该显卡准备着色器。fefw.ini 中的 [gfx] gpu 或环境变量 NXRT_GFX_GPU 会覆盖此设置。',
   'settings.gpu.auto': '自动（显存最大的独立显卡）',
   'settings.gpu.discrete': '独立显卡',
   'settings.gpu.integrated': '核显（省电）',

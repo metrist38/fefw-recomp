@@ -175,7 +175,7 @@ export async function render(el, ctx) {
       const unpacked = await api('import_nup', { path: picked });
       if (seq !== pathSeq || el.dataset.visit !== visit) return;
       nupBusy = false;
-      await applyPath(unpacked);
+      await applyPath(unpacked, { force: true });
       return;
     } catch (e) {
       if (seq !== pathSeq || el.dataset.visit !== visit) return;
@@ -185,7 +185,7 @@ export async function render(el, ctx) {
     draw();
   }
 
-  async function applyPath(next) {
+  async function applyPath(next, { force = false } = {}) {
     const nextPath = (next || '').trim();
     if (/\.nup$/i.test(nextPath)) {
       await importNup(nextPath);
@@ -199,7 +199,7 @@ export async function render(el, ctx) {
     path = nextPath;
     report = nextReport;
     const running = !!(setup && setup.progress.state === 'running');
-    if (nextReport && nextReport.chosen && !running && (nextPath !== saved || saveInFlight > 0)) {
+    if (nextReport && nextReport.chosen && !running && (force || nextPath !== saved || saveInFlight > 0)) {
       saveInFlight++;
       try {
         const savedReport = await api('save_dump', { path: nextPath });
