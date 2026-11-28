@@ -996,7 +996,7 @@ int update_hook(::Ctx*, uint64_t, void*) {
             const uint64_t t_ms = SDL_GetTicks();
             if (t_ms - last_present_ms >= 16) {
                 last_present_ms = t_ms;
-                if ((st.window && platform::minimized()) || !nvn::present_last_frame_again()) diag_frame_tick();
+                if ((st.window && platform::minimized()) || !nvn::present_last_frame_again()) diag_progress();
             }
             Sleep(4);
         }
