@@ -23,6 +23,7 @@
 // textures, host pixel edits and BC5 images. A failed scratch or staging allocation falls back for that texture.
 // Tests: tests/gfx/test_nvn_astc_gpu.cpp; [nvn] astc_gpu_probe, astc_gpu_fail_test and astc_gpu_slow (docs/CONFIG.md).
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -92,6 +93,53 @@ struct AstcRateWindow {
         }
         ++slow_passes;
         return now_ns - slow_since_ns >= hold_ns && slow_passes >= kSize;
+    }
+};
+
+enum class AstcKind : uint8_t { Rgba = 0, Bc7 = 1, Bc1 = 2, Count = 3 };
+
+// Per-output-format rate state: BC1 and BC7 can differ by two orders of magnitude on the same GPU (e.g. Maxwell GTX 960: BC1 ~1.5 ms per
+// M texel, BC7 ~150-200 ms per M texel). Keeping each format's window and smoothed rate separate stops fast BC1 passes from masking slow
+// BC7 passes in cost estimates, band sizing, cache decisions and the slow-GPU hand-back to the CPU (#248).
+struct AstcRateTracker {
+    static constexpr size_t kKinds = static_cast<size_t>(AstcKind::Count);
+    struct Entry {
+        double rate = 150e3;            // texels per ms of GPU time, smoothed
+        uint32_t samples = 0;           // passes that went into it
+        double peak = 0.0;              // fastest pass rate seen for this kind
+        AstcRateWindow win;             // last timed passes (raw rates, before `slow`)
+    };
+    Entry k[kKinds];
+
+    Entry& at(AstcKind kind) { return k[static_cast<size_t>(kind)]; }
+    const Entry& at(AstcKind kind) const { return k[static_cast<size_t>(kind)]; }
+
+    double rate_now(AstcKind kind, double slow) const {
+        const Entry& e = at(kind);
+        double r = e.rate;
+        if (e.win.n >= 8) r = std::min(r, e.win.median());
+        return r / slow;
+    }
+
+    // Record one timed pass (raw texels/ms, before `slow`). Returns true when this kind's window triggers the slow-GPU hand-off.
+    bool record(AstcKind kind, double pass_rate, double slow, double handoff_ms, uint64_t now_ns, uint64_t hold_ns, bool check_handoff) {
+        Entry& e = at(kind);
+        e.rate = 0.8 * e.rate + 0.2 * pass_rate;
+        ++e.samples;
+        e.peak = std::max(e.peak, pass_rate);
+        e.win.add(pass_rate);
+        return check_handoff && handoff_ms > 0.0 && e.win.slow_for(handoff_ms / slow, now_ns, hold_ns);
+    }
+
+    // Speed class for [nvn] bc7_cache choices: 0 unmeasured, 1 fast, 2 slow (any measured BC7/BC1 kind slower than cache_rate).
+    int cache_speed(double slow, double cache_rate) const {
+        bool any = false;
+        for (size_t i = 0; i < kKinds; ++i) {
+            if (i == static_cast<size_t>(AstcKind::Rgba) || k[i].samples < 6) continue;
+            any = true;
+            if (k[i].peak / slow < cache_rate) return 2;
+        }
+        return any ? 1 : 0;
     }
 };
 

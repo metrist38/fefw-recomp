@@ -65,7 +65,16 @@ constexpr double kStandinMs = 1.5;                   // what a quick CPU stand-i
 struct DecodePush { uint32_t in_base, out_base, width, height, bw, bh, bx, bslice, srgb; };
 struct EncodePush { uint32_t in_base, out_base, width, height, bx, bslice; };
 
-enum class Kind { Rgba, Bc7, Bc1 };
+using Kind = AstcKind;
+
+const char* kind_name(Kind k) {
+    switch (k) {
+        case Kind::Bc7: return "BC7";
+        case Kind::Bc1: return "BC1";
+        case Kind::Rgba: return "RGBA8";
+        default: return "?";
+    }
+}
 
 // One level of a texture, or some of its layers when the level is larger than a chunk.
 struct Region {
@@ -159,12 +168,8 @@ struct State {
     double max_present_ms = 0.0;      // and its estimate
     uint64_t present_ns = 0;          // when that present was first seen
     double frame_ms = 1000.0 / 30.0;  // present interval, smoothed
-    double rate = 150e3;              // texels per millisecond of GPU time (decode and encode), measured
-    uint32_t rate_samples = 0;        // passes that went into it
-    double peak = 0.0;                // the fastest pass rate seen: what the GPU can do (the game's own work on the GPU only makes passes look slower,
-                                      // and the smoothed rate fell below kCacheRate during a hub load on an RTX 4070 Super), for the cache choices
     double slow = 1.0;                // [nvn] astc_gpu_slow (test aid): the budget, the bands and the cache choice see a GPU this many times slower
-    AstcRateWindow win;               // the last timed passes (raw rates, before `slow`)
+    AstcRateTracker rates;            // per-format measured rates and windows (raw rates, before `slow`)
     // ---- statistics (render thread; the counters any thread) ----
     uint64_t n_tex = 0, n_texels = 0, n_deferred = 0, n_stale = 0, n_timed = 0, timed_texels = 0, n_failed = 0;
     double gpu_ms = 0.0, max_ms = 0.0, max_wait_ms = 0.0, sum_wait_ms = 0.0;   // waits: how long a queued texture's stand-in was on screen
@@ -980,16 +985,25 @@ void log_stats(bool force) {
     s.last_log_ns = now;
     s.logged_tex = s.n_tex;
     const double mt = static_cast<double>(s.timed_texels) / 1e6;
+    std::string win_str;
+    for (Kind k : {Kind::Bc7, Kind::Bc1, Kind::Rgba}) {
+        const AstcRateWindow& w = s.rates.at(k).win;
+        if (!w.n) continue;
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "%s%s %u (median %.2f, fastest quarter %.2f)", win_str.empty() ? "" : ", ",
+                      kind_name(k), w.n, w.median() > 0.0 ? 1e6 / w.median() : 0.0, w.quarter_ms());
+        win_str += buf;
+    }
+    if (win_str.empty()) win_str = "none";
     NXLOG_I(kTag, "%llu textures (%.1f M texels) transcoded on the GPU, %.0f ms of render thread time for it (%.3f ms a texture): %.1f ms of GPU time over %llu timed passes (%.1f M texels, "
                   "%.2f ms per M texel, longest pass %.1f ms); %llu textures queued over the budget (their stand-ins on screen for %.0f ms on average, %.0f ms and %u presents at most; %zu "
                   "waiting, %llu dropped as stale); %llu stored in the cache (%llu not), %llu failed; most in one present: %.1f M texels "
-                  "(estimated %.0f ms); last %u passes: median %.2f ms per M texel, fastest quarter %.2f",
+                  "(estimated %.0f ms); last passes (ms/M texel): %s",
             static_cast<unsigned long long>(s.n_tex), static_cast<double>(s.n_texels) / 1e6, static_cast<double>(s.cpu_ns) * 1e-6,
             static_cast<double>(s.cpu_ns) * 1e-6 / static_cast<double>(s.n_tex), s.gpu_ms, static_cast<unsigned long long>(s.n_timed), mt, mt > 0 ? s.gpu_ms / mt : 0.0, s.max_ms,
             static_cast<unsigned long long>(s.n_deferred), s.n_waited ? s.sum_wait_ms / static_cast<double>(s.n_waited) : 0.0, s.max_wait_ms, s.max_wait_presents, s.q.size(),
             static_cast<unsigned long long>(s.n_stale), static_cast<unsigned long long>(s.stored.load()), static_cast<unsigned long long>(s.store_failed.load()),
-            static_cast<unsigned long long>(s.n_failed), static_cast<double>(s.max_present_texels) / 1e6, s.max_present_ms, s.win.n,
-            s.win.median() > 0.0 ? 1e6 / s.win.median() : 0.0, s.win.quarter_ms());
+            static_cast<unsigned long long>(s.n_failed), static_cast<double>(s.max_present_texels) / 1e6, s.max_present_ms, win_str.c_str());
 }
 
 struct CpuTimer {
@@ -1037,27 +1051,25 @@ double budget_now() {
     return b;
 }
 
-// The rate the estimates use: the smoothed one, or the median of the last passes when that is slower (AstcRateWindow).
-double rate_now() {
+// The rate the estimates use: the smoothed one for `k`, or the median of its last passes when that is slower (AstcRateTracker).
+double rate_now(Kind k) {
     const State& s = S();
-    double r = s.rate;
-    if (s.win.n >= 8) r = std::min(r, s.win.median());
-    return r / s.slow;
+    return s.rates.rate_now(k, s.slow);
 }
-double cost_ms(uint64_t texels) { return static_cast<double>(texels) / rate_now(); }
+double cost_ms(Kind k, uint64_t texels) { return static_cast<double>(texels) / rate_now(k); }
 
-// [gfx] astc_gpu_cap_ms: true when this many more texels would take the present past the cap, or past kUnmeasuredTexels while the
-// rate is still the built-in guess
-bool over_cap(uint64_t texels) {
+// [gfx] astc_gpu_cap_ms: true when this many more texels would take the present past the cap, or past kUnmeasuredTexels while this
+// format's rate is still the built-in guess
+bool over_cap(Kind k, uint64_t texels) {
     const State& s = S();
     if (s.cap_ms <= 0.0) return false;
-    if (s.spent_ms + cost_ms(texels) > s.cap_ms) return true;
-    return s.rate_samples < static_cast<uint32_t>(kHandoffSamples) && s.spent_texels > 0 && s.spent_texels + texels > kUnmeasuredTexels;
+    if (s.spent_ms + cost_ms(k, texels) > s.cap_ms) return true;
+    return s.rates.at(k).samples < static_cast<uint32_t>(kHandoffSamples) && s.spent_texels > 0 && s.spent_texels + texels > kUnmeasuredTexels;
 }
 
-bool affordable(uint64_t texels) {
+bool affordable(Kind k, uint64_t texels) {
     State& s = S();
-    return s.spent_ms + cost_ms(texels) <= budget_now() && !over_cap(texels);
+    return s.spent_ms + cost_ms(k, texels) <= budget_now() && !over_cap(k, texels);
 }
 
 // ---- one texture --------------------------------------------------------------------------------------------------------------
@@ -1074,7 +1086,7 @@ bool build_work(Texture* t, PreparedTexture& prep, gfx::Buffer& staged, Work& w)
     const uint32_t drop = tex_level_drop(t), levels = tex_levels(t);
     if (tex_layers(t) != prep.layers || tex_vk_format(t) != prep.format) return false;
     // a band is about 2 ms of GPU time at the measured rate, and whole rows of both block sizes (ASTC rows of bh texels, BC rows of 4)
-    const uint64_t band_texels = static_cast<uint64_t>(std::clamp(rate_now() * 2.0, 65536.0, 4194304.0));
+    const uint64_t band_texels = static_cast<uint64_t>(std::clamp(rate_now(w.j.kind) * 2.0, 65536.0, 4194304.0));
     uint32_t step = w.j.bh;
     while (step % 4) step += w.j.bh;
     w.texels = 0;
@@ -1162,7 +1174,7 @@ Pass run_work(Work& w, Frame& f, bool budgeted) {
         const Region& r = w.j.rg[end];
         const uint64_t n = static_cast<uint64_t>(r.w) * r.h * r.slices;
         // within the budget; the first region of a present goes whatever its size (a band is about 2 ms)
-        if (budgeted && (cost_ms(texels + n) > room || over_cap(texels + n)) && (end > w.next || s.spent_ms > 0.0)) break;
+        if (budgeted && (cost_ms(j.kind, texels + n) > room || over_cap(j.kind, texels + n)) && (end > w.next || s.spent_ms > 0.0)) break;
         texels += n;
         src_bytes += region_in(r, j.bw, j.bh);
         j.rg.push_back(r);
@@ -1241,7 +1253,7 @@ Pass run_work(Work& w, Frame& f, bool budgeted) {
     if (slot >= 0) vkCmdWriteTimestamp2(f.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, s.qpool, static_cast<uint32_t>(slot) * 2 + 1);
     if (rb && last) barrier(f.cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
     w.next = end;
-    s.spent_ms += cost_ms(texels);
+    s.spent_ms += cost_ms(j.kind, texels);
     s.spent_texels += texels;
     if (s.spent_texels > s.max_present_texels) {
         s.max_present_texels = s.spent_texels;
@@ -1281,7 +1293,8 @@ Pass run_work(Work& w, Frame& f, bool budgeted) {
     }
     if (slot >= 0 || store_rb) {
         const uint32_t tid = t->id;
-        f.defer([slot, store_rb, texels, tid, meta = std::move(meta)]() mutable {
+        const Kind kind = j.kind;
+        f.defer([slot, store_rb, texels, tid, kind, meta = std::move(meta)]() mutable {
             State& s2 = S();
             if (slot >= 0) {
                 uint64_t r[4] = {};
@@ -1294,22 +1307,19 @@ Pass run_work(Work& w, Frame& f, bool budgeted) {
                         s2.gpu_ms += ms;
                         if (ms > s2.max_ms) {
                             s2.max_ms = ms;
-                            if (ms > 4.0) NXLOG_I(kTag, "texture %u: a pass of %.2f M texels took %.2f ms of GPU time (the longest so far)", tid, static_cast<double>(texels) / 1e6, ms);
+                            if (ms > 4.0) NXLOG_I(kTag, "texture %u (%s): a pass of %.2f M texels took %.2f ms of GPU time (the longest so far)", tid, kind_name(kind), static_cast<double>(texels) / 1e6, ms);
                         }
                         if (texels >= 65536 && ms > 0.0) {   // small ones time the fixed cost, not the rate
-                            s2.rate = 0.8 * s2.rate + 0.2 * (static_cast<double>(texels) / ms);
-                            ++s2.rate_samples;
-                            s2.peak = std::max(s2.peak, static_cast<double>(texels) / ms);
-                            if (s2.rate_samples >= 6) s2.speed.store(s2.peak / s2.slow < kCacheRate ? 2 : 1, std::memory_order_relaxed);
-                            s2.win.add(static_cast<double>(texels) / ms);
-                            // the limit against the raw rates: [nvn] astc_gpu_slow makes every pass that many times slower
-                            if (s2.is_auto && s2.handoff_ms > 0.0 && !s2.handoff.load() &&
-                                s2.win.slow_for(s2.handoff_ms / s2.slow, ft::now_ns(), kHandoffHoldNs)) {
+                            const bool check = s2.is_auto && !s2.handoff.load();
+                            const bool handoff = s2.rates.record(kind, static_cast<double>(texels) / ms, s2.slow, s2.handoff_ms, ft::now_ns(), kHandoffHoldNs, check);
+                            s2.speed.store(s2.rates.cache_speed(s2.slow, kCacheRate), std::memory_order_relaxed);
+                            if (handoff) {
                                 s2.handoff.store(true, std::memory_order_release);
-                                NXLOG_W(kTag, "this GPU transcodes ASTC slowly: the fastest quarter of its last %u passes took %.1f ms per M texel and more, the "
+                                const AstcRateWindow& w = s2.rates.at(kind).win;
+                                NXLOG_W(kTag, "this GPU transcodes ASTC (%s) slowly: the fastest quarter of its last %u passes took %.1f ms per M texel and more, the "
                                               "median %.1f (the limit is %.1f, [gfx] astc_gpu_handoff_ms), for %.0f s. ASTC textures are transcoded on the "
                                               "CPU from now on, as with [gfx] astc_gpu = off (on keeps the GPU)",
-                                        AstcRateWindow::kSize, s2.win.quarter_ms() * s2.slow, 1e6 / s2.win.median() * s2.slow, s2.handoff_ms,
+                                        kind_name(kind), AstcRateWindow::kSize, w.quarter_ms() * s2.slow, 1e6 / w.median() * s2.slow, s2.handoff_ms,
                                         static_cast<double>(kHandoffHoldNs) * 1e-9);
                             }
                         }
@@ -1378,8 +1388,8 @@ AstcGpu astc_gpu_upload(Texture* t, Frame& f, PreparedTexture& prep, gfx::Buffer
     // Over this present's budget, or textures are waiting already (they keep their order): queued. Not an RGBA8 image (no stand-in exists for
     // it, and a decode alone is short), and not a texture the GPU is done with sooner than the render thread would be with its stand-in: queueing
     // that one costs the frame more than transcoding it (an area's textures all arrive in one frame: 2,200 stand-ins were 3.3 s of it).
-    const bool cheap = cost_ms(w.texels) <= kStandinMs && !over_cap(w.texels);
-    if (w.j.kind != Kind::Rgba && !cheap && (!s.q.empty() || !affordable(w.texels))) {
+    const bool cheap = cost_ms(w.j.kind, w.texels) <= kStandinMs && !over_cap(w.j.kind, w.texels);
+    if (w.j.kind != Kind::Rgba && !cheap && (!s.q.empty() || !affordable(w.j.kind, w.texels))) {
         w.queued_present = presents_now();
         s.q.push_back(std::move(w));
         ++s.n_deferred;

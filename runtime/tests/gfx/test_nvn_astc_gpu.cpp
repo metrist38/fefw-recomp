@@ -384,6 +384,42 @@ NXTEST(rate_window_judges_slow_gpus_by_their_usual_pass) {
     }
 }
 
+// AstcRateTracker: fast BC1 passes must not mask slow BC7 passes in cost estimates, cache speed or CPU hand-off (#248).
+NXTEST(rate_tracker_separates_bc1_and_bc7) {
+    using nxrt::nvn::be::gpu::AstcKind;
+    using nxrt::nvn::be::gpu::AstcRateTracker;
+    const uint64_t sec = 1000000000ull, hold = 5 * sec;
+    const double limit = 10.0, cache_rate = 400e3;               // 10 ms/M texel hand-off, 2.5 ms/M texel cache threshold
+    auto rate = [](double ms_per_mtexel) { return 1e6 / ms_per_mtexel; };
+    {   // Maxwell-like GPU with astc_bc = bc1: ~2/3 fast BC1 (1.5 ms/M texel), ~1/3 slow BC7 (160 ms/M texel)
+        AstcRateTracker tr;
+        bool off = false;
+        uint64_t t = sec;
+        for (int i = 0; i < 400 && !off; ++i, t += sec / 20) {
+            const bool is_bc7 = (i % 3 == 0);
+            const AstcKind k = is_bc7 ? AstcKind::Bc7 : AstcKind::Bc1;
+            const bool trig = tr.record(k, rate(is_bc7 ? 160.0 : 1.5), 1.0, limit, t, hold, true);
+            CHECK_MSG(!trig || is_bc7, "only BC7 should trigger slow-GPU hand-off");
+            off = off || trig;
+        }
+        CHECK(off);
+        CHECK(1e6 / tr.rate_now(AstcKind::Bc7, 1.0) > 100.0);    // BC7 estimate stays slow
+        CHECK(1e6 / tr.rate_now(AstcKind::Bc1, 1.0) < 5.0);      // BC1 estimate stays fast
+        CHECK_EQ(tr.cache_speed(1.0, cache_rate), 2);            // slow BC7 turns disk caching on despite fast BC1
+    }
+    {   // Fast GPU with both BC1 and BC7: never hands off, cache speed reports fast
+        AstcRateTracker tr;
+        bool off = false;
+        uint64_t t = sec;
+        for (int i = 0; i < 300; ++i, t += sec / 10) {
+            const bool is_bc7 = (i % 3 == 0);
+            off = off || tr.record(is_bc7 ? AstcKind::Bc7 : AstcKind::Bc1, rate(is_bc7 ? 1.5 : 0.8), 1.0, limit, t, hold, true);
+        }
+        CHECK(!off);
+        CHECK_EQ(tr.cache_speed(1.0, cache_rate), 1);
+    }
+}
+
 NXTEST(decode_to_rgba8_is_bit_exact) {
     if (!astctest::transcoder_or_skip()) return;
     Rig r;
