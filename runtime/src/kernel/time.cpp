@@ -29,10 +29,12 @@ void set_paused(bool paused, uint32_t owner_tid) {
     AcquireSRWLockExclusive(&g_pause_lock);
     const bool was = g_paused.load(std::memory_order_relaxed);
     if (paused && !was) {
+        // Flip g_pause_seq to odd BEFORE sampling g_pause_start_qpc so every fast-path system_tick()
+        // that completes with the previous even seq sampled QPC strictly before g_pause_start_qpc.
+        g_pause_seq.fetch_add(1, std::memory_order_seq_cst);   // now odd (readers wait on g_pause_lock)
         g_pause_start_qpc.store(raw_qpc(), std::memory_order_relaxed);
         g_pause_owner_tid.store(owner_tid, std::memory_order_relaxed);
         g_paused.store(true, std::memory_order_release);
-        g_pause_seq.fetch_add(1, std::memory_order_release);   // now odd (paused)
     } else if (!paused && was) {
         const uint64_t now = raw_qpc();
         const uint64_t start = g_pause_start_qpc.load(std::memory_order_relaxed);
@@ -41,7 +43,7 @@ void set_paused(bool paused, uint32_t owner_tid) {
         }
         g_pause_owner_tid.store(0, std::memory_order_relaxed);
         g_paused.store(false, std::memory_order_release);
-        g_pause_seq.fetch_add(1, std::memory_order_release);   // now even (running, offset updated)
+        g_pause_seq.fetch_add(1, std::memory_order_seq_cst);   // now even (running, offset updated)
         WakeAllConditionVariable(&g_pause_cv);
     }
     ReleaseSRWLockExclusive(&g_pause_lock);
@@ -85,7 +87,7 @@ uint64_t system_tick() {
         }
         const uint64_t off = g_paused_qpc_total.load(std::memory_order_relaxed);
         const uint64_t q = raw_qpc();
-        if (g_pause_seq.load(std::memory_order_acquire) == s1) {
+        if (g_pause_seq.load(std::memory_order_seq_cst) == s1) {
             v = q > off ? q - off : 0;
             break;
         }
