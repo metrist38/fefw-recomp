@@ -156,6 +156,21 @@ inline uint32_t astc_band_rows(uint32_t width, uint32_t bh, uint64_t band_texels
     return static_cast<uint32_t>(std::max<uint64_t>(step, steps * step));
 }
 
+// Per-present GPU time budget (ms) for ASTC transcodes. During paced gameplay, slow frames do not inflate the budget past 4 ms
+// (2 ms under >= 92% OS VRAM usage). During loading screens (almost no scene draws), lift the floor above the gameplay throttle
+// so pre-uploaded textures drain during the loading screen instead of spilling into gameplay (still bounded by astc_gpu_cap_ms).
+inline double astc_gpu_budget_ms(double budget_ms, double frame_ms, bool loading, int os_vram_pct) {
+    double b = budget_ms * frame_ms / (1000.0 / 30.0);
+    if (loading) {
+        const double load_floor = std::min(budget_ms * 8.0, os_vram_pct >= 92 ? 16.0 : 64.0);
+        b = std::max(b, load_floor);
+    } else {
+        b = std::min(b, std::min(budget_ms, 4.0));
+        if (os_vram_pct >= 92) b = std::min(b, 2.0);
+    }
+    return b;
+}
+
 // Any thread. True when the GPU path is on for this device. The first caller with wait builds the pipelines and runs the self-test (0.1 s
 // with the driver's shader cache, 1.4 to 2.3 s at a first start; background jobs call it so); without wait the answer is false until that
 // has happened (the render thread).

@@ -448,6 +448,21 @@ NXTEST(rate_tracker_separates_bc1_and_bc7) {
     }
 }
 
+NXTEST(budget_lifts_during_loading_screens) {
+    using nxrt::nvn::be::gpu::astc_gpu_budget_ms;
+    // Gameplay: capped at 4 ms (2 ms under >= 92% OS VRAM pressure), even on slow frames.
+    CHECK(std::abs(astc_gpu_budget_ms(8.0, 1000.0 / 60.0, false, 50) - 4.0) < 1e-6);
+    CHECK(std::abs(astc_gpu_budget_ms(8.0, 1000.0 / 30.0, false, 50) - 4.0) < 1e-6);
+    CHECK(std::abs(astc_gpu_budget_ms(8.0, 100.0, false, 50) - 4.0) < 1e-6);
+    CHECK(std::abs(astc_gpu_budget_ms(8.0, 1000.0 / 30.0, false, 92) - 2.0) < 1e-6);
+    // Loading screens at 60 fps: lifted to 64 ms (16 ms under VRAM pressure) so queued BC7 drains before gameplay.
+    CHECK(std::abs(astc_gpu_budget_ms(8.0, 1000.0 / 60.0, true, 50) - 64.0) < 1e-6);
+    CHECK(std::abs(astc_gpu_budget_ms(8.0, 1000.0 / 60.0, true, 92) - 16.0) < 1e-6);
+    // Custom small budget_ms still scales proportionally; very slow loading frames keep their scaled budget above the floor.
+    CHECK(std::abs(astc_gpu_budget_ms(0.5, 1000.0 / 60.0, true, 50) - 4.0) < 1e-6);
+    CHECK(std::abs(astc_gpu_budget_ms(8.0, 500.0, true, 50) - 120.0) < 1e-6);
+}
+
 NXTEST(decode_to_rgba8_is_bit_exact) {
     if (!astctest::transcoder_or_skip()) return;
     Rig r;
