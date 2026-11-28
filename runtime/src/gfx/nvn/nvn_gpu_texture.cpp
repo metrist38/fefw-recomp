@@ -3129,13 +3129,15 @@ void tex_load_uploads(Frame& f) {
     std::unordered_set<const Texture*> reg;
     pool_registered_textures(reg);
     uint64_t n = 0;
+    uint32_t scanned = 0;
     for (const Texture* ct : reg) {
+        if ((++scanned & 255) == 0 && std::chrono::steady_clock::now() >= until) break;
         Texture* t = const_cast<Texture*>(ct);
         if (!tex_early_upload_ok(t) || !texprep::has_result(t)) continue;
+        if (std::chrono::steady_clock::now() >= until) break;
         tex_ensure_current(t, f);
         tex_transition(t, f, tex_sampled_layout(t));
         ++n;
-        if ((n & 7) == 0 && std::chrono::steady_clock::now() >= until) break;
     }
     if (!n) return;
     static uint64_t total = 0;
