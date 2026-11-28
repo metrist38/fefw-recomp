@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Start-up and menu tweaks (S46, docs/S46.md): the `[tweaks]` keys of controls.ini that skip the opening cutscene, skip the title's
-// intro movie and speed up the front end. All are off by default, so the game starts and plays as it always did. The game module does the
-// work (games/mpr/mpr_fastboot.cpp); this file is only the settings: the struct, the reader and the writer of its keys.
+// intro movie, speed up the front end, and control runtime pause. The start-up/menu tweaks are off by default (pause_unfocused is on
+// by default). The game module does the work (games/mpr/mpr_fastboot.cpp); this file is only the settings: the struct, the reader and
+// the writer of its keys.
 //
 //   [tweaks] skip_intro = 0        1: the opening cutscene of a new game (the gunship landing on the Frigate) is skipped through the game's own
 //                                  cutscene skip, without a key press
@@ -21,6 +22,8 @@ struct FastbootSettings {
     int menu_speed = 2;             // [tweaks] menu_speed, 1..4; read only while fast_menus is on
     std::string language;           // [tweaks] language: a language name (AmericanEnglish, French, ...) or "" = auto (the Windows language).
                                     // Read by the settings service at start-up (services/common.cpp); a change applies at the next start.
+    bool pause_in_menu = false;     // [tweaks] pause_in_menu: freeze the game, cutscenes, movies and audio while the F1 menu is open
+    bool pause_unfocused = true;    // [tweaks] pause_unfocused: freeze the game, cutscenes, movies and audio while the window is not in focus
 };
 
 // One `key = value` of the [tweaks] section. Returns false with *msg set for a bad value of one of these keys. *known is false (and the

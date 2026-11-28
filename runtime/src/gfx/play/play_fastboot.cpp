@@ -51,6 +51,8 @@ bool fastboot_apply(const std::string& key, const std::string& value, FastbootSe
         s->language = lower(value) == "auto" ? std::string() : value;
         return true;
     }
+    if (k == "pause_in_menu") return set_bool(&s->pause_in_menu);
+    if (k == "pause_unfocused") return set_bool(&s->pause_unfocused);
     *known = false;
     return true;
 }
@@ -62,6 +64,8 @@ void fastboot_format(const FastbootSettings& s, std::string* out) {
     kv("fast_menus", s.fast_menus ? "1" : "0");
     kv("menu_speed", std::to_string(std::clamp(s.menu_speed, 1, 4)));
     kv("language", s.language.empty() ? "auto" : s.language);
+    kv("pause_in_menu", s.pause_in_menu ? "1" : "0");
+    kv("pause_unfocused", s.pause_unfocused ? "1" : "0");
 }
 
 double fastboot_menu_rate(const FastbootSettings& s) { return s.fast_menus ? static_cast<double>(std::clamp(s.menu_speed, 1, 4)) : 1.0; }

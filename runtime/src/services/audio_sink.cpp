@@ -25,6 +25,7 @@ std::shared_ptr<AudioSink> g_sink;
 
 std::atomic<float> g_volume{1.0f};
 std::atomic<bool> g_muted{false};
+std::atomic<bool> g_paused{false};
 std::once_flag g_volume_once;
 
 float clamp_volume(float v) { return v < 0.0f ? 0.0f : (v > kMaxVolume ? kMaxVolume : v); }
@@ -123,6 +124,18 @@ float master_volume() {
 void set_muted(bool m) { g_muted.store(m); }
 bool muted() { return g_muted.load(); }
 float effective_volume() { return g_muted.load() ? 0.0f : master_volume(); }
+
+void set_paused(bool p) {
+    g_paused.store(p, std::memory_order_release);
+    std::shared_ptr<AudioSink> s;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        s = g_sink;
+    }
+    if (s) s->set_paused(p);
+}
+
+bool paused() { return g_paused.load(std::memory_order_acquire); }
 
 void apply_boost(int16_t* pcm, uint32_t frames, uint32_t channels, float boost, uint32_t sample_rate, BoostLimiter& limiter) {
     if (!(boost > 1.0f)) {

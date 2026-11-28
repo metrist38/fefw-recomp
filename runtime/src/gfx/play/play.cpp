@@ -39,6 +39,7 @@
 #include "nxrt/kernel.h"
 #include "nxrt/svc.h"
 #include "nxrt/config.h"
+#include "nxrt/diag.h"
 #include "nxrt/jc2_mouse.h"
 #include "nxrt/dispatch.h"
 #include "nxrt/hooks.h"
@@ -700,7 +701,7 @@ void poll_pads(uint64_t now) {
     const size_t n = input::gamepad_list(infos, 8);
     bool have_six = false;
     uint16_t lo = 0, hi = 0;
-    {
+    if (!kernel::is_paused()) {
         const float l = std::max(st.vib[0][0].load(), st.vib[1][0].load()), h = std::max(st.vib[0][1].load(), st.vib[1][1].load());
         map_rumble(l, h, st.settings.pad, &lo, &hi);
         // 16 levels: the game changes the amplitude a little almost every frame in battle, and a report per frame over Bluetooth backs up
@@ -819,7 +820,7 @@ int update_hook(::Ctx*, uint64_t, void*) {
     if (st.window && on_pump_thread) platform::pump_events();
 
     // settings queued by the page
-    {
+    auto apply_pending_settings = [&](uint64_t ts_now) {
         std::unique_lock<std::mutex> lk(st.mu);
         if (st.have_pending) {
             Settings s = st.pending;
@@ -830,7 +831,7 @@ int update_hook(::Ctx*, uint64_t, void*) {
             st.settings = s;
             st.settings_epoch++;
             lk.unlock();
-            st.engine->set_settings(s, now);
+            st.engine->set_settings(s, ts_now);
             apply_frame_cap(s);
             display_tuning(s.display);
             if (const GamePlay* gp = game_play(); gp && gp->settings_changed) gp->settings_changed(s);     // the game's display options, lock-on
@@ -856,7 +857,8 @@ int update_hook(::Ctx*, uint64_t, void*) {
             if (!save_settings(st.path, s, &err)) NXLOG_W(kTag, "cannot save %s: %s", st.path.c_str(), err.c_str());
             else NXLOG_I(kTag, "settings applied and saved to %s", st.path.c_str());
         }
-    }
+    };
+    apply_pending_settings(now);
 
     apply_unfocused_mute();
 
@@ -920,6 +922,90 @@ int update_hook(::Ctx*, uint64_t, void*) {
     const bool overlay_visible = st.overlay && st.overlay->blocks_game();
     if (overlay_visible && !st.overlay_was_visible) st.engine->release_all(now);
     st.overlay_was_visible = overlay_visible;
+
+    // External pause signal (e.g. Decky plugin watching Steam Game Mode focus / QAM / Steam menu / sleep).
+    // Checked at most every 40 ms so normal gameplay pays near-zero cost.
+    static const std::string ext_pause_path = [] {
+        const char* env = std::getenv("NXRT_PAUSE_FILE");
+        return (env && *env) ? std::string(env) : std::string("Z:\\tmp\\fefw-recomp-pause");
+    }();
+    auto external_pause_active = [&]() {
+        static uint64_t last_check_ms = 0;
+        static bool cached = false;
+        const uint64_t t_ms = SDL_GetTicks();
+        if (t_ms - last_check_ms >= 40) {
+            last_check_ms = t_ms;
+            cached = GetFileAttributesA(ext_pause_path.c_str()) != INVALID_FILE_ATTRIBUTES;
+        }
+        return cached;
+    };
+    auto should_pause = [&]() {
+        const bool ov = st.overlay && st.overlay->blocks_game();
+        const bool unfoc = st.window && !platform::focused();
+        const bool ext = st.window && st.settings.fastboot.pause_unfocused && external_pause_active();
+        return (ov && st.settings.fastboot.pause_in_menu) || (unfoc && st.settings.fastboot.pause_unfocused) || ext;
+    };
+    if (should_pause()) {
+        const bool unfoc_start = st.window && !platform::focused();
+        const bool ext_start = st.window && st.settings.fastboot.pause_unfocused && external_pause_active();
+        NXLOG_I(kTag, "pause: entering runtime pause (%s)",
+                overlay_visible ? "F1 menu open" : (ext_start ? "Steam menu / external" : (unfoc_start ? "window unfocused" : "other")));
+        st.engine->release_all(now);
+        kernel::set_paused(true, GetCurrentThreadId());
+        audio::set_paused(true);
+        // Silence any active rumble/haptics so controllers do not keep buzzing while the guest is paused.
+        st.vib[0][0].store(0.f);
+        st.vib[0][1].store(0.f);
+        st.vib[1][0].store(0.f);
+        st.vib[1][1].store(0.f);
+        haptic::push(0, 0, 0.f, 0.f, 0.f, 0.f);
+        haptic::push(0, 1, 0.f, 0.f, 0.f, 0.f);
+        {
+            input::GamepadInfo pads[8];
+            const size_t np = input::gamepad_list(pads, 8);
+            for (size_t i = 0; i < np; ++i) {
+                if (haptic::legacy_rumble(pads[i].id)) platform::gamepad_rumble(pads[i].id, 0, 0, 0);
+            }
+            st.rumble_lo = 0;
+            st.rumble_hi = 0;
+            st.last_rumble_ns = now;
+        }
+        st.limiter.reset_schedule();
+        if (st.window) {
+            if (platform::relative_mouse()) platform::set_relative_mouse(false);
+            platform::set_cursor_visible(true);
+        }
+        uint64_t last_present_ms = 0;
+        while (should_pause()) {
+            const uint64_t pnow = now_ns();
+            if (st.window && on_pump_thread) {
+                platform::pump_events();
+                g_last_pump_ms.store(SDL_GetTicks(), std::memory_order_relaxed);
+                platform::set_text_input(st.overlay && st.overlay->keyboard_open());
+                if (platform::relative_mouse()) platform::set_relative_mouse(false);
+                platform::set_cursor_visible(true);
+            }
+            apply_pending_settings(pnow);
+            input::Event pbuf[64];
+            for (;;) {
+                const size_t got = input::queue_drain(pbuf, 64);
+                if (!got) break;
+                for (size_t i = 0; i < got; ++i) handle_event(pbuf[i], pnow);
+            }
+            if (st.overlay && st.overlay->blocks_game()) poll_pads(pnow);
+            const uint64_t t_ms = SDL_GetTicks();
+            if (t_ms - last_present_ms >= 16) {
+                last_present_ms = t_ms;
+                if ((st.window && platform::minimized()) || !nvn::present_last_frame_again()) diag_progress();
+            }
+            Sleep(4);
+        }
+        st.overlay_was_visible = st.overlay && st.overlay->blocks_game();
+        audio::set_paused(false);
+        kernel::set_paused(false);
+        st.limiter.reset_schedule();
+        NXLOG_I(kTag, "pause: resumed");
+    }
 
     if (st.window) {
         platform::set_text_input(st.overlay && st.overlay->keyboard_open());   // typed text for the on-screen keyboard only
@@ -1504,6 +1590,8 @@ bool start(const StartOptions& opt) {
 void stop() {
     G& st = g();
     if (!st.started) return;
+    audio::set_paused(false);
+    kernel::set_paused(false);
     vpad_shutdown();      // a virtual pad from a test script does not outlive play mode
     if (const GamePlay* gp = game_play(); gp && gp->remove) gp->remove();
     kernel::set_blocked_hook(0, nullptr);

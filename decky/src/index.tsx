@@ -14,7 +14,7 @@ import {
   staticClasses,
   ToggleField,
 } from "@decky/ui";
-import { addEventListener, definePlugin, removeEventListener, routerHook, toaster } from "@decky/api";
+import { addEventListener, callable, definePlugin, removeEventListener, routerHook, toaster } from "@decky/api";
 import { useEffect, useState, type ReactElement } from "react";
 import { FaDownload } from "react-icons/fa";
 import { pickSettingChoice } from "./game-tabs";
@@ -56,8 +56,23 @@ interface GameSessions {
   RegisterForAppLifetimeNotifications?(cb: (n: { unAppID: number; bRunning: boolean }) => void): { unregister(): void };
 }
 
-declare const SteamClient: { Settings?: SteamSettings; Apps?: SteamApps; GameSessions?: GameSessions } | undefined;
+interface FocusChangeEvent {
+  focusedApp?: { appid?: number; pid?: number };
+}
+
+interface SystemApi {
+  UI?: {
+    RegisterForFocusChangeEvents?(cb: (e: FocusChangeEvent) => void): { unregister(): void };
+  };
+  RegisterForOnSuspendRequest?(cb: () => void): { unregister(): void };
+  RegisterForOnResumeFromSuspend?(cb: () => void): { unregister(): void };
+}
+
+declare const SteamClient: { Settings?: SteamSettings; Apps?: SteamApps; GameSessions?: GameSessions; System?: SystemApi } | undefined;
 declare const appStore: AppStore | undefined;
+
+const setGamePaused = callable<[paused: boolean], void>("set_game_paused");
+const STEAM_UI_APPID = 769;
 
 const Note = ({ text }: { text: string }) => (
   <PanelSectionRow>
@@ -247,10 +262,49 @@ export default definePlugin(() => {
   const timer = setInterval(() => void follow(), 2000);
   void bootstrapStore();
 
+  // Signal runtime pause when Steam Game Mode UI (Steam menu, QAM, keyboard) takes focus or the device suspends,
+  // but only while at least one game session is running (so no stale flag is left behind for Desktop Mode launches).
+  const runningApps = new Set<number>();
+  let lastFocusedAppId = 0;
+  let suspended = false;
+  let lastPausedSent = false;
+  const syncPaused = () => {
+    const want = runningApps.size > 0 && (suspended || lastFocusedAppId === STEAM_UI_APPID);
+    if (want === lastPausedSent) return;
+    lastPausedSent = want;
+    void setGamePaused(want);
+  };
+  const focusSub =
+    typeof SteamClient !== "undefined"
+      ? SteamClient.System?.UI?.RegisterForFocusChangeEvents?.((e) => {
+          const appid = e?.focusedApp?.appid ?? 0;
+          lastFocusedAppId = appid;
+          if (appid !== 0 && appid !== STEAM_UI_APPID) runningApps.add(appid);
+          syncPaused();
+        })
+      : undefined;
+  const suspendSub =
+    typeof SteamClient !== "undefined"
+      ? SteamClient.System?.RegisterForOnSuspendRequest?.(() => {
+          suspended = true;
+          syncPaused();
+        })
+      : undefined;
+  const resumeSub =
+    typeof SteamClient !== "undefined"
+      ? SteamClient.System?.RegisterForOnResumeFromSuspend?.(() => {
+          suspended = false;
+          syncPaused();
+        })
+      : undefined;
+
   // Refresh status once when a game exits so the game page updates without polling during gameplay.
   const lifetimeSub =
     typeof SteamClient !== "undefined"
       ? SteamClient.GameSessions?.RegisterForAppLifetimeNotifications?.((n) => {
+          if (n.bRunning) runningApps.add(n.unAppID);
+          else runningApps.delete(n.unAppID);
+          syncPaused();
           // only this game's end matters, and the status saw it running; polling is held back while it runs
           if (!n.bRunning && isGameRunning()) void rereadState();
         })
@@ -286,7 +340,11 @@ export default definePlugin(() => {
     onDismount() {
       removeEventListener("fefw_job_done", done);
       clearInterval(timer);
+      focusSub?.unregister();
+      suspendSub?.unregister();
+      resumeSub?.unregister();
       lifetimeSub?.unregister();
+      void setGamePaused(false);
       stopStore();
       renderPatch?.unpatch();
       routerHook.removePatch("/library/app/:appid", appPagePatch);

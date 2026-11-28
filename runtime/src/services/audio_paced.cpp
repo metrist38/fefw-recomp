@@ -26,6 +26,7 @@ public:
         channels_ = channels;
         written_ = played_ = 0.0;
         running_ = starved_ = false;
+        if (audio::paused()) paused_ = true;
         opened_ = true;
         return sample_rate > 0 && (channels == 2 || channels == 6);
     }
@@ -85,6 +86,18 @@ public:
         return s;
     }
 
+    void set_paused(bool paused) override {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (paused == paused_) return;
+        if (paused) {
+            advance();            // account for elapsed time up to the pause instant
+            paused_ = true;
+        } else {
+            paused_ = false;
+            last_ = Clock::now(); // exclude paused time on resume
+        }
+    }
+
 private:
     static constexpr double kWarmupSeconds = 0.5;
     static constexpr double kCapacitySeconds = 0.120;   // the device queue: what XAudio2 would hold before write() drops
@@ -92,7 +105,7 @@ private:
     // Moves the play position to now (mu_ held). A queue that empties is an underrun until the next write. The lowest level is sampled
     // by every call, so it is the level just before a refill when the renderer polls the queue each frame.
     void advance() {
-        if (!running_) return;
+        if (!running_ || paused_) return;
         const auto now = Clock::now();
         const double dt = std::chrono::duration<double>(now - last_).count();
         last_ = now;
@@ -115,7 +128,7 @@ private:
     std::mutex mu_;
     double skew_;
     uint32_t rate_ = 0, channels_ = 0;
-    bool opened_ = false, running_ = false, starved_ = false;
+    bool opened_ = false, running_ = false, starved_ = false, paused_ = false;
     double written_ = 0.0, played_ = 0.0, peak_ = 0.0, low_ = -1.0;
     Clock::time_point last_{}, t_first_{};
     uint64_t frames_written_ = 0, frames_accepted_ = 0, frames_dropped_ = 0, underruns_ = 0;

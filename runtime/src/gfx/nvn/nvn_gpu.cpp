@@ -1460,14 +1460,14 @@ void present(Window* window, int index) {
 
 // The game's last frame once more, queued like a present (the overlay is drawn on top as on every frame). Only when the game has not
 // presented for 50 ms and nothing is queued, so it never competes with the game's own frames.
-void present_again() {
-    if (!g) return;
+bool present_again() {
+    if (!g) return false;
     Ref<Window> keep;
     int index = -1;
     {
         std::lock_guard<std::mutex> lk(g->pmu);
-        if (!g->last_window || g->presents_pending > 0) return;
-        if (std::chrono::steady_clock::now() - g->last_present < std::chrono::milliseconds(50)) return;
+        if (!g->last_window || g->presents_pending > 0) return false;
+        if (std::chrono::steady_clock::now() - g->last_present < std::chrono::milliseconds(50)) return false;
         keep = g->last_window;
         index = g->last_index;
         ++g->presents_pending;
@@ -1485,6 +1485,7 @@ void present_again() {
         g_gauge_render_queue.add(1);
     }
     g->qcv.notify_one();
+    return true;
 }
 
 void destroy_texture_gpu(TexGpu* t) {
@@ -1761,8 +1762,8 @@ bool install_backend(const BackendDesc& desc) {
 }
 
 void shutdown_backend() { be::gpu::tear_down(); }
-void present_last_frame_again() {
-    if (be::gpu::active()) be::gpu::present_again();
+bool present_last_frame_again() {
+    return be::gpu::active() && be::gpu::present_again();
 }
 
 bool prepare_shaders(const ShaderPrepareOptions& o, ShaderPrepareResult* r) {

@@ -33,6 +33,7 @@
 
 #include "audren/Integration/ThreadBoost.h"
 #include "nxrt/audio_sink.h"
+#include "nxrt/kernel.h"
 #include "nxrt/config.h"
 #include "nxrt/gauge.h"
 #include "nxrt/log.h"
@@ -432,6 +433,14 @@ void Stream::pace() {
     bool idle = true;                // nothing submitted and unreleased: the clocks restart with the next buffer
 
     while (started_) {
+        if (nxrt::kernel::is_paused()) {
+            lk.unlock();
+            nxrt::kernel::wait_if_paused();
+            lk.lock();
+            clock_at = Clock::now();
+            dev_moved = clock_at;
+            continue;
+        }
         if (queue_.empty()) {
             idle = true;
             cv_.wait(lk, [this] { return !started_ || !queue_.empty(); });

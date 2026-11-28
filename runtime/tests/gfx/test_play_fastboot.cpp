@@ -18,23 +18,29 @@ NXTEST(defaults_are_vanilla) {
     CHECK(!s.fastboot.fast_menus);
     CHECK_EQ(s.fastboot.menu_speed, 2);
     CHECK_EQ(fastboot_menu_rate(s.fastboot), 1.0);
+    CHECK(!s.fastboot.pause_in_menu);
+    CHECK(s.fastboot.pause_unfocused);
 }
 
 NXTEST(read_and_write) {
     Settings s;
     std::string err;
-    REQUIRE(parse_settings("[tweaks]\nskip_intro = 1\nSkip_Boot_Logos = yes\nfast_menus = on\nmenu_speed = 4\n", &s, &err));
+    REQUIRE(parse_settings("[tweaks]\nskip_intro = 1\nSkip_Boot_Logos = yes\nfast_menus = on\nmenu_speed = 4\npause_in_menu = 1\npause_unfocused = 0\n", &s, &err));
     CHECK(s.fastboot.skip_intro);
     CHECK(s.fastboot.skip_boot_logos);
     CHECK(s.fastboot.fast_menus);
     CHECK_EQ(s.fastboot.menu_speed, 4);
     CHECK_EQ(fastboot_menu_rate(s.fastboot), 4.0);
+    CHECK(s.fastboot.pause_in_menu);
+    CHECK(!s.fastboot.pause_unfocused);
     const std::string text = format_settings(s);
-    CHECK(text.find("[tweaks]\nskip_intro = 1\nskip_boot_logos = 1\nfast_menus = 1\nmenu_speed = 4\n") != std::string::npos);
+    CHECK(text.find("[tweaks]\nskip_intro = 1\nskip_boot_logos = 1\nfast_menus = 1\nmenu_speed = 4\nlanguage = auto\npause_in_menu = 1\npause_unfocused = 0\n") != std::string::npos);
     Settings back;
     REQUIRE(parse_settings(text, &back, &err));
     CHECK(back.fastboot.skip_intro && back.fastboot.skip_boot_logos && back.fastboot.fast_menus);
     CHECK_EQ(back.fastboot.menu_speed, 4);
+    CHECK(back.fastboot.pause_in_menu);
+    CHECK(!back.fastboot.pause_unfocused);
 }
 
 NXTEST(bad_values_and_other_keys) {
@@ -44,6 +50,8 @@ NXTEST(bad_values_and_other_keys) {
     CHECK(err.find("menu_speed") != std::string::npos);
     CHECK(!parse_settings("[tweaks]\nmenu_speed = 0\n", &s, &err));
     CHECK(!parse_settings("[tweaks]\nskip_intro = maybe\n", &s, &err));
+    CHECK(!parse_settings("[tweaks]\npause_in_menu = maybe\n", &s, &err));
+    CHECK(!parse_settings("[tweaks]\npause_unfocused = nope\n", &s, &err));
     std::vector<std::string> warnings;
     REQUIRE(parse_settings("[tweaks]\nsome_other_tweak = 1\nfast_menus = 1\n", &s, &err, &warnings));   // a key of another tweak: a warning, not an error
     CHECK(s.fastboot.fast_menus);

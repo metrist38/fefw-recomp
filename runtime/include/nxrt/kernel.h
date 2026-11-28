@@ -186,12 +186,15 @@ void install_spin_hint();                // WFE / YIELD of the lifted code hand 
 void install_busy_mutex_hle();           // nn::os::LockBusyMutex as host code that yields while it waits (busy_mutex.cpp, [sched] busy_mutex_hle)
 void sched_reset_for_tests();            // forget the slot and re-read the config at the next sched_info()
 
-// ---- time --------------------------------------------------------------------------------------------------------------------
-uint64_t system_tick();                  // the console tick (tick_hz()), from QueryPerformanceCounter
+// ---- time & pause ------------------------------------------------------------------------------------------------------------
+uint64_t system_tick();                  // the console tick (tick_hz()), from QueryPerformanceCounter (frozen while paused)
 constexpr uint64_t kTickHzSwitch1 = 19200000;   // Switch 1 system tick (CNTFRQ_EL0)
 constexpr uint64_t kTickHzSwitch2 = 31250000;   // Switch 2 system tick (SDK 20.5 for Switch 2 uses 31.25 MHz)
 uint64_t tick_hz();                      // the registered game's platform tick frequency
 void sleep_ns(int64_t ns);               // high-resolution sleep; <= 0 yields
+void set_paused(bool paused, uint32_t owner_tid = 0);   // freezes system_tick() and holds other guest/audio threads in wait_if_paused()
+bool is_paused();
+void wait_if_paused();                   // blocks until unpaused (no-op on the owner_tid thread)
 
 // ---- kernel-level synchronisation (the SVC semantics; kernel_sync.cpp) -------------------------------------------------------
 // ArbitrateLock / WaitProcessWideKeyAtomic / WaitForAddress ... operate on guest memory words. Exposed for tests and for HLE code.

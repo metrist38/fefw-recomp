@@ -91,6 +91,7 @@ public:
     bool has_device_clock() const override { return true; }   // SamplesPlayed is the device's own clock
     const char* name() const override { return "xaudio2"; }
     SinkStats stats() override;
+    void set_paused(bool paused) override;
 
 private:
     struct Slot {
@@ -173,6 +174,7 @@ private:
     std::atomic<uint32_t> queue_peak_frames_{0};
     std::atomic<uint32_t> queue_low_frames_{0xffffffffu};
     std::atomic<bool> started_{false};   // a buffer has been submitted since open()
+    std::atomic<bool> paused_{false};    // host pause (source voice stopped without flushing)
     std::atomic<bool> starved_{false};   // the device is out of buffers now; an underrun is counted once per such stretch
 };
 
@@ -252,14 +254,21 @@ bool XAudio2Sink::open(uint32_t sample_rate, uint32_t channels) {
     starved_.store(false);
     submitted_frames_.store(0);
     callback_.owner = this;
-    hr = engine_->CreateSourceVoice(&source_, &wfx.Format, 0, XAUDIO2_DEFAULT_FREQ_RATIO, &callback_, nullptr, nullptr);
+    IXAudio2SourceVoice* created = nullptr;
+    hr = engine_->CreateSourceVoice(&created, &wfx.Format, 0, XAUDIO2_DEFAULT_FREQ_RATIO, &callback_, nullptr, nullptr);
     if (FAILED(hr)) {
         NXLOG_W("audio", "xaudio2: CreateSourceVoice(%u Hz, %u ch) failed (0x%08lx)", sample_rate, channels,
                 static_cast<unsigned long>(hr));
         teardown();
         return false;
     }
-    hr = source_->Start(0);
+    {
+        std::lock_guard<std::mutex> vl(voice_mu_);
+        source_ = created;
+        if (!(paused_.load(std::memory_order_acquire) || audio::paused())) {
+            hr = source_->Start(0);
+        }
+    }
     if (FAILED(hr)) {
         NXLOG_W("audio", "xaudio2: source voice Start failed (0x%08lx)", static_cast<unsigned long>(hr));
         teardown();
@@ -286,6 +295,14 @@ bool XAudio2Sink::open(uint32_t sample_rate, uint32_t channels) {
 void XAudio2Sink::close() {
     want_rate_ = want_channels_ = 0;
     close_device();
+}
+
+void XAudio2Sink::set_paused(bool paused) {
+    std::lock_guard<std::mutex> vl(voice_mu_);
+    paused_.store(paused, std::memory_order_release);
+    if (!source_) return;
+    if (paused) source_->Stop(0);
+    else source_->Start(0);
 }
 
 void XAudio2Sink::follow_device() {

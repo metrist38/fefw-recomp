@@ -30,13 +30,9 @@
 
 namespace nxrt::audren {
 
-// C# ITickSource: a monotonic clock in guest ticks. Counter() is steady_clock nanoseconds scaled to 19.2 MHz: ns * 192 / 10000.
+// C# ITickSource: a monotonic clock in guest ticks (frozen while the runtime is paused).
 struct TickSource {
-    uint64_t Counter() const {
-        uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-
-        return ns * 192 / 10000;
-    }
+    uint64_t Counter() const { return nxrt::kernel::system_tick(); }
 
     uint64_t Frequency() const { return nxrt::kernel::tick_hz(); }   // the console tick (Constants::TargetTimerFrequency on Switch 1)
 };
@@ -254,6 +250,10 @@ class AudioRendererManager {
         int stallLogs = 0;
 
         while (_isRunning.load()) {
+            if (nxrt::kernel::is_paused()) {
+                nxrt::kernel::wait_if_paused();
+                continue;
+            }
             const auto frameStart = std::chrono::steady_clock::now();
 
             {
