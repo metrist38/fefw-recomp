@@ -111,10 +111,48 @@ std::atomic<uint64_t> g_generation{0};
 std::atomic<uint64_t> g_faults{0};
 std::atomic<uint64_t> g_write_seq{0};  // bumped after any region sets written[] + has_written
 std::atomic<uint64_t> g_waits{0};      // rounds a fault waited for another releaser (statistics, tests)
+std::atomic<uint64_t> g_release_fails{0};    // bumped before releasing-- if a release's VirtualProtect did not make the page RW
+std::atomic<uint64_t> g_virtual_queries{0};  // VirtualQuery calls made by fault/arm/freeze slow paths (statistics, tests)
 std::atomic<uint64_t> g_guard_faults{0};   // accesses that hit a guarded page
 std::atomic<GuardHandler> g_guard_fn{nullptr};
 std::mutex g_mu;                       // create / destroy
 PVOID g_veh = nullptr;
+
+// Lock-free table of recently released pages (bits [63:12] = page address, bits [11:0] = per-slot monotonic tag in 1..4095).
+// Lets a concurrent writer whose fault arrives just after another thread finished VirtualProtect(PAGE_READWRITE) retry once
+// without calling VirtualQuery on the multi-GiB heap view or acquiring g_transitions.
+constexpr size_t kRecentRelMask = 1023;
+std::atomic<uint64_t> g_recent_rel[kRecentRelMask + 1]{};
+
+size_t recent_slot(uint64_t pg) { return static_cast<size_t>((pg >> 12) ^ (pg >> 22)) & kRecentRelMask; }
+
+void record_recent_release(uint64_t page_addr) {
+    const uint64_t pg = page_addr & ~(kPage - 1);
+    std::atomic<uint64_t>& cell = g_recent_rel[recent_slot(pg)];
+    uint64_t cur = cell.load(std::memory_order_relaxed);
+    for (;;) {
+        uint64_t tag = (cur & 0xfffull) + 1;
+        if (tag > 0xfffull) tag = 1;
+        const uint64_t next = pg | tag;
+        if (cell.compare_exchange_weak(cur, next, std::memory_order_release, std::memory_order_relaxed)) break;
+    }
+}
+
+uint64_t lookup_recent_release(uint64_t page_addr) {
+    const uint64_t pg = page_addr & ~(kPage - 1);
+    const uint64_t v = g_recent_rel[recent_slot(pg)].load(std::memory_order_acquire);
+    return (v & ~0xfffull) == pg ? v : 0;
+}
+
+void wait_releasing(Region* r, uint64_t page, bool count_wait) {
+    std::atomic<uint16_t>& rel = r->releasing[page];
+    for (int i = 0; rel.load(std::memory_order_seq_cst) != 0; ++i) {
+        if (count_wait) g_waits.fetch_add(1, std::memory_order_relaxed);
+        if (i < 50) YieldProcessor();
+        else if (i < 1000) Sleep(0);
+        else Sleep(1);
+    }
+}
 
 // Operating-system writes in progress (OsWriteScope): arm() leaves these ranges alone, so a page cannot become read-only between the
 // release in before_os_write and the end of the ReadFile that fills it. When every slot is taken, g_os_overflow stops all arming.
@@ -198,6 +236,7 @@ bool any_set(const std::atomic<uint64_t>* bm, uint64_t first, uint64_t count) {
 }
 
 DWORD page_protect(uint64_t addr) {
+    g_virtual_queries.fetch_add(1, std::memory_order_relaxed);
     MEMORY_BASIC_INFORMATION mbi{};
     if (VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof mbi) != sizeof mbi) return 0;
     if (mbi.State != MEM_COMMIT) return 0;
@@ -258,8 +297,9 @@ bool heap_write_landed_late(uint64_t addr) {
     return true;
 }
 
-// One page of a region becomes writable and counts as written. True when the page is ours to handle (the faulting write may retry).
-// The caller holds the region's lock shared.
+// One page of a region becomes writable and counts as written. True when this call claimed the armed bit and made the page writable;
+// false when the bit was already cleared (another releaser won, or the page was not armed) or VirtualProtect did not see PAGE_READONLY.
+// The caller holds the region's lock shared. Never calls VirtualQuery.
 bool release_page(Region* r, uint64_t page) {
     const uint64_t b = bit(page);
     const uint64_t w = page >> 6;
@@ -269,12 +309,12 @@ bool release_page(Region* r, uint64_t page) {
     const bool armed = (r->prot[w].load(std::memory_order_acquire) & b) != 0;
     if (armed) rel.fetch_add(1, std::memory_order_seq_cst);
     const uint64_t old = r->prot[w].fetch_and(~b, std::memory_order_acq_rel);
-    r->valid[w].fetch_and(~b, std::memory_order_acq_rel);
-    r->written[w].fetch_or(b, std::memory_order_seq_cst);
-    r->has_written.store(true, std::memory_order_seq_cst);
-    g_write_seq.fetch_add(1, std::memory_order_seq_cst);
-    const uint64_t addr = r->base + page * kPage;
     if (old & b) {
+        r->valid[w].fetch_and(~b, std::memory_order_acq_rel);
+        r->written[w].fetch_or(b, std::memory_order_seq_cst);
+        r->has_written.store(true, std::memory_order_seq_cst);
+        g_write_seq.fetch_add(1, std::memory_order_seq_cst);
+        const uint64_t addr = r->base + page * kPage;
         bool ok = true;
         DWORD was = 0;
         if (!VirtualProtect(reinterpret_cast<void*>(addr), kPage, PAGE_READWRITE, &was)) {
@@ -284,26 +324,13 @@ bool release_page(Region* r, uint64_t page) {
             VirtualProtect(reinterpret_cast<void*>(addr), kPage, was, &tmp);
             ok = false;
         }
+        if (ok) record_recent_release(addr);
+        else g_release_fails.fetch_add(1, std::memory_order_seq_cst);
         rel.fetch_sub(1, std::memory_order_seq_cst);
         return ok;
     }
     if (armed) rel.fetch_sub(1, std::memory_order_seq_cst);   // lost the race for the bit: not a releaser (and must not make others wait for it)
-    // Not armed (any more): another releaser (also holding the lock shared) may be making it writable right now. Wait for it only while
-    // such a release is in progress; with none, a read-only page is somebody else's and the fault goes on at once. The count is read before
-    // the protection: a releaser that cleared the bit before our fetch_and has counted itself in before that, so a zero count means every
-    // such release has finished and its effect is visible in the protection we read next.
-    // The wait has no round limit: a releaser that is counted in will finish (it only has its VirtualProtect left), but it may be descheduled
-    // for a long time on a busy machine, and giving up early would pass a fault on that is ours (seen as an unhandled access violation).
-    for (int i = 0;; ++i) {
-        const uint16_t busy = rel.load(std::memory_order_seq_cst);
-        const DWORD pr = page_protect(addr) & 0xff;
-        if (pr == PAGE_READWRITE || pr == PAGE_EXECUTE_READWRITE) return true;
-        if (pr != PAGE_READONLY || busy == 0) return false;
-        g_waits.fetch_add(1, std::memory_order_relaxed);
-        if (i < 50) YieldProcessor();
-        else if (i < 1000) Sleep(0);
-        else Sleep(1);
-    }
+    return false;
 }
 
 // Coalesces contiguous armed pages ahead of a sequential write fault into a single VirtualProtect call.
@@ -346,7 +373,12 @@ uint64_t release_pages_ahead(Region* r, uint64_t start_page, uint64_t max_count)
         r->has_written.store(true, std::memory_order_seq_cst);
         g_write_seq.fetch_add(1, std::memory_order_seq_cst);
         DWORD was = 0;
-        VirtualProtect(reinterpret_cast<void*>(r->base + start_page * kPage), static_cast<SIZE_T>(claimed * kPage), PAGE_READWRITE, &was);
+        const bool ok = VirtualProtect(reinterpret_cast<void*>(r->base + start_page * kPage), static_cast<SIZE_T>(claimed * kPage), PAGE_READWRITE, &was) != 0;
+        if (ok) {
+            for (uint64_t i = 0; i < claimed; ++i) record_recent_release(r->base + (start_page + i) * kPage);
+        } else {
+            g_release_fails.fetch_add(1, std::memory_order_seq_cst);
+        }
         for (uint64_t i = 0; i < claimed; ++i) r->releasing[start_page + i].fetch_sub(1, std::memory_order_seq_cst);
     }
     return claimed;
@@ -459,40 +491,52 @@ retry:
     }
     bool ours = false, guarded_now = false;
     g_busy.fetch_add(1, std::memory_order_seq_cst);
-    // Pass 0 releases the page in the regions that armed it (usually one). Only when none did (another thread released it meanwhile) does
-    // pass 1 ask release_page's slow path in every region: a VirtualQuery over the heap view (milliseconds), which the whole-heap texture
-    // region paid for every fault on a pool copy's page, under its shared lock (notes/pacing.md).
-    for (int pass = 0; pass < 2 && !ours && !guarded_now; ++pass) {
-        for (RegionCursor cursor; Region* r = cursor.next();) {
-            if (addr < r->base || addr >= r->base + r->npages * kPage) continue;
-            SharedLock lk(r);
-            const uint64_t pg = (addr - r->base) / kPage;
-            // guard() (exclusive lock) may have guarded the page since guarded_at above: under the shared lock the bit is final. Releasing a
-            // guarded page cleared its armed bit and left it no-access with nobody to claim the fault (a crash in Dagsion, notes/pacing.md).
-            if (test(r->guard.get(), pg)) { guarded_now = true; continue; }
-            if (pass == 0 && !test(r->prot.get(), pg)) continue;
-            const bool mine = release_page(r, pg);
-            if (mine) {
-                fault_stat(r, addr);
-                if (pass == 0) {
-                    // Sequential bulk-write coalescing: after 2+ consecutive sequential page faults on the same region,
-                    // release a small contiguous run (8-16 pages = 32-64 KiB) in one VirtualProtect call.
-                    thread_local const Region* tl_seq_r = nullptr;
-                    thread_local uint64_t tl_seq_next_pg = ~0ull;
-                    thread_local uint32_t tl_seq_run = 0;
-                    if (r == tl_seq_r && pg == tl_seq_next_pg) {
-                        ++tl_seq_run;
-                        uint64_t extra = 0;
-                        if (tl_seq_run >= 2) extra = release_pages_ahead(r, pg + 1, tl_seq_run >= 6 ? 15 : 7);
-                        tl_seq_next_pg = pg + 1 + extra;
-                    } else {
-                        tl_seq_r = r;
-                        tl_seq_next_pg = pg + 1;
-                        tl_seq_run = 0;
-                    }
-                }
+    // Pass 0: claim the armed bit in the region that owns this page. Pre-checking prot/guard before acquiring SharedLock skips
+    // non-owning overlapping regions (e.g. the whole-heap texture region on every pool-mirror fault) without touching g_transitions.
+    for (RegionCursor cursor; Region* r = cursor.next();) {
+        if (ours || guarded_now) break;
+        if (addr < r->base || addr >= r->base + r->npages * kPage) continue;
+        const uint64_t pg = (addr - r->base) / kPage;
+        if (!test(r->prot.get(), pg) && !test(r->guard.get(), pg)) continue;
+        SharedLock lk(r);
+        // guard() (exclusive lock) may have guarded the page since guarded_at above: under the shared lock the bit is final. Releasing a
+        // guarded page cleared its armed bit and left it no-access with nobody to claim the fault (a crash in Dagsion, notes/pacing.md).
+        if (test(r->guard.get(), pg)) { guarded_now = true; continue; }
+        if (!test(r->prot.get(), pg)) continue;
+        const bool mine = release_page(r, pg);
+        if (mine) {
+            fault_stat(r, addr);
+            // Sequential bulk-write coalescing: after 2+ consecutive sequential page faults on the same region,
+            // release a small contiguous run (8-16 pages = 32-64 KiB) in one VirtualProtect call.
+            thread_local const Region* tl_seq_r = nullptr;
+            thread_local uint64_t tl_seq_next_pg = ~0ull;
+            thread_local uint32_t tl_seq_run = 0;
+            if (r == tl_seq_r && pg == tl_seq_next_pg) {
+                ++tl_seq_run;
+                uint64_t extra = 0;
+                if (tl_seq_run >= 2) extra = release_pages_ahead(r, pg + 1, tl_seq_run >= 6 ? 15 : 7);
+                tl_seq_next_pg = pg + 1 + extra;
+            } else {
+                tl_seq_r = r;
+                tl_seq_next_pg = pg + 1;
+                tl_seq_run = 0;
             }
-            ours |= mine;
+        }
+        ours |= mine;
+    }
+    // Pass 1: another thread may have cleared the armed bit and still be inside VirtualProtect (releasing > 0). Wait for it outside
+    // SharedLock / g_transitions and without calling VirtualQuery (which walks the multi-GiB heap view and stalls arm() and other faults).
+    if (!ours && !guarded_now) {
+        for (RegionCursor cursor; Region* r = cursor.next();) {
+            if (ours || guarded_now) break;
+            if (addr < r->base || addr >= r->base + r->npages * kPage) continue;
+            const uint64_t pg = (addr - r->base) / kPage;
+            if (test(r->guard.get(), pg)) { guarded_now = true; break; }
+            if (r->releasing[pg].load(std::memory_order_seq_cst) != 0) {
+                const uint64_t fails0 = g_release_fails.load(std::memory_order_seq_cst);
+                wait_releasing(r, pg, true);
+                if (g_release_fails.load(std::memory_order_seq_cst) == fails0) ours = true;
+            }
         }
     }
     if (guarded_now) {     // the guard fault as above; the write then faults again on the armed page and is released as usual
@@ -501,6 +545,19 @@ retry:
         if (GuardHandler fn = g_guard_fn.load(std::memory_order_acquire)) fn(addr & ~(kPage - 1));
         drop_guard(addr & ~(kPage - 1), kPage);
         return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    // Fast retry for a page another thread finished releasing just before this fault entered pass 0: retry the store once per
+    // (page, slot release tag) without VirtualQuery or g_transitions. A genuine foreign protection faults again immediately with the
+    // same tag and falls through to final_retry() below.
+    thread_local uint64_t tl_fast_val = 0;
+    if (ours) {
+        tl_fast_val = 0;
+    } else if (const uint64_t rv = lookup_recent_release(addr)) {
+        if (tl_fast_val != rv) {
+            tl_fast_val = rv;
+            g_busy.fetch_sub(1, std::memory_order_seq_cst);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
     }
     if (!ours) {
         const int decision = final_retry(addr, kind, generation);
@@ -647,7 +704,10 @@ void region_destroy(Region* r) {
         set_bits(r->prot.get(), p, q - p, false);
         set_bits(r->guard.get(), p, q - p, false);
         DWORD was = 0;
-        VirtualProtect(reinterpret_cast<void*>(r->base + p * kPage), static_cast<SIZE_T>((q - p) * kPage), PAGE_READWRITE, &was);
+        if (VirtualProtect(reinterpret_cast<void*>(r->base + p * kPage), static_cast<SIZE_T>((q - p) * kPage), PAGE_READWRITE, &was) &&
+            q - p <= kRecentRelMask + 1) {
+            for (uint64_t i = p; i < q; ++i) record_recent_release(r->base + i * kPage);
+        }
         p = q;
     }
     }
@@ -694,52 +754,59 @@ bool arm(Region* r, uint64_t first, uint64_t count) {
     // view costs a walk of every page of the run of identical pages after the address (5 to 85 ms on a 10 GiB heap), under the exclusive
     // lock that the game's write faults wait for: the 70 ms frames of the hitch line's "write-watch arming" (notes/pacing.md). The table
     // is read before the lock (memory.cpp takes its lock first and region locks inside it); a change since shows in the epoch.
-    const uint64_t epoch = heap_epoch();
-    const int table = heap_rw_pages(a, n);
-    ExclusiveLock lk(r, true);
-    if (any_set(r->ban.get(), first, count)) return false;
-    // A file read (or a mapping change in memory.cpp) into these pages is in progress: leave them alone. Its scope is published before it
-    // releases pages under the shared lock, so either this sees it, or its release waits for this arm and undoes it.
-    if (os_write_overlaps(a, a + n) || freeze_overlaps(a, a + n)) return false;
-    if (table == 1 && heap_epoch() == epoch) {
-        // what the walk below checks besides the table: no page read-guarded here, or read-only because another region armed it
-        if (any_set(r->guard.get(), first, count)) return false;
-        bool other = false;
-        g_busy.fetch_add(1, std::memory_order_seq_cst);
-        for (RegionCursor cursor; Region* o = cursor.next();) {
-            if (other) break;
-            if (o == r) continue;
-            const uint64_t lo = std::max(a, o->base), end = std::min(a + n, o->base + o->npages * kPage);
-            if (lo < end) other = any_set(o->prot.get(), (lo - o->base) / kPage, (end - lo) / kPage);
+    // When table == 1 and a concurrent heap change bumped the epoch, retry outside ExclusiveLock rather than falling into VirtualQuery
+    // under the global g_transitions exclusive lock.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const uint64_t epoch = heap_epoch();
+        const int table = heap_rw_pages(a, n);
+        if (table == 0) return false;
+        ExclusiveLock lk(r, true);
+        if (any_set(r->ban.get(), first, count)) return false;
+        // A file read (or a mapping change in memory.cpp) into these pages is in progress: leave them alone. Its scope is published before it
+        // releases pages under the shared lock, so either this sees it, or its release waits for this arm and undoes it.
+        if (os_write_overlaps(a, a + n) || freeze_overlaps(a, a + n)) return false;
+        if (table == 1) {
+            if (heap_epoch() != epoch) continue;   // retry heap_rw_pages outside ExclusiveLock instead of calling VirtualQuery on the heap
+            // what the walk below checks besides the table: no page read-guarded here, or read-only because another region armed it
+            if (any_set(r->guard.get(), first, count)) return false;
+            bool other = false;
+            g_busy.fetch_add(1, std::memory_order_seq_cst);
+            for (RegionCursor cursor; Region* o = cursor.next();) {
+                if (other) break;
+                if (o == r) continue;
+                const uint64_t lo = std::max(a, o->base), end = std::min(a + n, o->base + o->npages * kPage);
+                if (lo < end) other = any_set(o->prot.get(), (lo - o->base) / kPage, (end - lo) / kPage);
+            }
+            g_busy.fetch_sub(1, std::memory_order_seq_cst);
+            if (other) return false;
+        } else {
+            // table == -1: outside the primary heap view, or [memory] fast_query = false.
+            // every page committed read-write (the guest may have changed a protection; a page it made read-only is not ours to take)
+            for (uint64_t cur = a; cur < a + n;) {
+                g_virtual_queries.fetch_add(1, std::memory_order_relaxed);
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (VirtualQuery(reinterpret_cast<void*>(cur), &mbi, sizeof mbi) != sizeof mbi || mbi.State != MEM_COMMIT) return false;
+                const DWORD pr = mbi.Protect & 0xff;
+                const bool already = pr == PAGE_READONLY && all_set(r->prot.get(), (cur - r->base) / kPage,
+                                                                    (std::min<uint64_t>(a + n, reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize) - cur) / kPage);
+                if ((pr != PAGE_READWRITE && !already) || (mbi.Protect & PAGE_GUARD)) return false;
+                cur = std::min<uint64_t>(a + n, reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize);
+            }
         }
-        g_busy.fetch_sub(1, std::memory_order_seq_cst);
-        if (other) return false;
-    } else if (table == 0) {
-        return false;
-    } else {
-        // every page committed read-write (the guest may have changed a protection; a page it made read-only is not ours to take)
-        for (uint64_t cur = a; cur < a + n;) {
-            MEMORY_BASIC_INFORMATION mbi{};
-            if (VirtualQuery(reinterpret_cast<void*>(cur), &mbi, sizeof mbi) != sizeof mbi || mbi.State != MEM_COMMIT) return false;
-            const DWORD pr = mbi.Protect & 0xff;
-            const bool already = pr == PAGE_READONLY && all_set(r->prot.get(), (cur - r->base) / kPage,
-                                                                (std::min<uint64_t>(a + n, reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize) - cur) / kPage);
-            if ((pr != PAGE_READWRITE && !already) || (mbi.Protect & PAGE_GUARD)) return false;
-            cur = std::min<uint64_t>(a + n, reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize);
+        // Under the exclusive lock no fault is handled until both bits and protection are in place; a write that faults meanwhile waits and
+        // then releases the page. A write that lands before the protection does not fault, and the owner's copy (made later) still sees it.
+        set_bits(r->prot.get(), first, count, true);
+        set_bits(r->valid.get(), first, count, true);
+        DWORD was = 0;
+        if (!VirtualProtect(reinterpret_cast<void*>(a), static_cast<SIZE_T>(n), PAGE_READONLY, &was)) {
+            set_bits(r->valid.get(), first, count, false);
+            set_bits(r->prot.get(), first, count, false);
+            return false;
         }
+        g_generation.fetch_add(1, std::memory_order_seq_cst);
+        return true;
     }
-    // Under the exclusive lock no fault is handled until both bits and protection are in place; a write that faults meanwhile waits and
-    // then releases the page. A write that lands before the protection does not fault, and the owner's copy (made later) still sees it.
-    set_bits(r->prot.get(), first, count, true);
-    set_bits(r->valid.get(), first, count, true);
-    DWORD was = 0;
-    if (!VirtualProtect(reinterpret_cast<void*>(a), static_cast<SIZE_T>(n), PAGE_READONLY, &was)) {
-        set_bits(r->valid.get(), first, count, false);
-        set_bits(r->prot.get(), first, count, false);
-        return false;
-    }
-    g_generation.fetch_add(1, std::memory_order_seq_cst);
-    return true;
+    return false;
 }
 
 bool all_valid(const Region* r, uint64_t first, uint64_t count) {
@@ -923,56 +990,68 @@ ImportFreeze::ImportFreeze(const void* p, uint64_t n) {
     // "write-watch arming" 180 ms next to each pool import. The table is read before the lock (memory.cpp takes its lock first and the
     // tracker's inside it); a change since shows in the epoch, and then, or with another freeze over the range, the walk is done as before.
     const bool use_table = config_get_bool("memory", "freeze_table", true);   // read per freeze (imports are rare): the tests switch it
-    const uint64_t epoch = use_table ? heap_epoch() : 0;
-    const int table = use_table ? heap_rw_pages(lo, hi - lo) : -1;
-    // Exclusive against arm() and region destruction: the read-write runs found here are ours until the destructor gives them back.
-    AcquireSRWLockExclusive(&g_transitions);
     bool done = false;
-    if (table == 1 && heap_epoch() == epoch) {
+    for (int attempt = 0; use_table && !done && attempt < 3; ++attempt) {
+        const uint64_t epoch = heap_epoch();
+        const int table = heap_rw_pages(lo, hi - lo);
+        if (table != 1) break;
+        // Exclusive against arm() and region destruction: the read-write runs found here are ours until the destructor gives them back.
+        AcquireSRWLockExclusive(&g_transitions);
+        if (heap_epoch() != epoch) {
+            ReleaseSRWLockExclusive(&g_transitions);
+            continue;
+        }
         bool other = false;
         for (int k = 0; k < kFreezeSlots && !other; ++k) {
             if (k == slot_) continue;
             const uint64_t h = g_frz[k].hi.load(std::memory_order_seq_cst);
             other = h && g_frz[k].lo.load(std::memory_order_seq_cst) < hi && lo < h;
         }
-        if (!other) {
-            const uint64_t np = (hi - lo) / kPage;
-            std::vector<uint64_t> ours((np + 63) / 64, 0);   // pages read-only (or no-access) because a region armed or guarded them
-            g_busy.fetch_add(1, std::memory_order_seq_cst);
-            for (RegionCursor cursor; Region* r = cursor.next();) {
-                const uint64_t rlo = std::max(lo, r->base), rhi = std::min(hi, r->base + r->npages * kPage);
-                for (uint64_t a = rlo; a < rhi; a += kPage)
-                    if (test(r->prot.get(), (a - r->base) / kPage)) {
-                        const uint64_t q = (a - lo) / kPage;
-                        ours[q >> 6] |= uint64_t{1} << (q & 63);
-                    }
-            }
-            g_busy.fetch_sub(1, std::memory_order_seq_cst);
-            for (uint64_t q = 0; q < np;) {
-                while (q < np && (ours[q >> 6] >> (q & 63) & 1)) ++q;
-                const uint64_t s = q;
-                while (q < np && !(ours[q >> 6] >> (q & 63) & 1)) ++q;
-                if (q > s) {
-                    DWORD was = 0;
-                    const uint64_t a = lo + s * kPage, e = lo + q * kPage;
-                    if (VirtualProtect(reinterpret_cast<void*>(a), static_cast<SIZE_T>(e - a), PAGE_READONLY, &was)) runs_.emplace_back(a, e);
-                }
-            }
-            done = true;
-            g_freeze_table_hits.fetch_add(1, std::memory_order_relaxed);
+        if (other) {
+            ReleaseSRWLockExclusive(&g_transitions);
+            break;
         }
+        const uint64_t np = (hi - lo) / kPage;
+        std::vector<uint64_t> ours((np + 63) / 64, 0);   // pages read-only (or no-access) because a region armed or guarded them
+        g_busy.fetch_add(1, std::memory_order_seq_cst);
+        for (RegionCursor cursor; Region* r = cursor.next();) {
+            const uint64_t rlo = std::max(lo, r->base), rhi = std::min(hi, r->base + r->npages * kPage);
+            for (uint64_t a = rlo; a < rhi; a += kPage)
+                if (test(r->prot.get(), (a - r->base) / kPage)) {
+                    const uint64_t q = (a - lo) / kPage;
+                    ours[q >> 6] |= uint64_t{1} << (q & 63);
+                }
+        }
+        g_busy.fetch_sub(1, std::memory_order_seq_cst);
+        for (uint64_t q = 0; q < np;) {
+            while (q < np && (ours[q >> 6] >> (q & 63) & 1)) ++q;
+            const uint64_t s = q;
+            while (q < np && !(ours[q >> 6] >> (q & 63) & 1)) ++q;
+            if (q > s) {
+                DWORD was = 0;
+                const uint64_t a = lo + s * kPage, e = lo + q * kPage;
+                if (VirtualProtect(reinterpret_cast<void*>(a), static_cast<SIZE_T>(e - a), PAGE_READONLY, &was)) runs_.emplace_back(a, e);
+            }
+        }
+        done = true;
+        g_freeze_table_hits.fetch_add(1, std::memory_order_relaxed);
+        ReleaseSRWLockExclusive(&g_transitions);
     }
-    for (uint64_t a = lo; !done && a < hi;) {
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof mbi) != sizeof mbi) break;
-        const uint64_t end = std::min<uint64_t>(hi, reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize);
-        DWORD was = 0;
-        if (mbi.State == MEM_COMMIT && (mbi.Protect & 0xff) == PAGE_READWRITE && !(mbi.Protect & PAGE_GUARD) &&
-            VirtualProtect(reinterpret_cast<void*>(a), static_cast<SIZE_T>(end - a), PAGE_READONLY, &was))
-            runs_.emplace_back(a, end);
-        a = end;
+    if (!done) {
+        AcquireSRWLockExclusive(&g_transitions);
+        for (uint64_t a = lo; a < hi;) {
+            g_virtual_queries.fetch_add(1, std::memory_order_relaxed);
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof mbi) != sizeof mbi) break;
+            const uint64_t end = std::min<uint64_t>(hi, reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize);
+            DWORD was = 0;
+            if (mbi.State == MEM_COMMIT && (mbi.Protect & 0xff) == PAGE_READWRITE && !(mbi.Protect & PAGE_GUARD) &&
+                VirtualProtect(reinterpret_cast<void*>(a), static_cast<SIZE_T>(end - a), PAGE_READONLY, &was))
+                runs_.emplace_back(a, end);
+            a = end;
+        }
+        ReleaseSRWLockExclusive(&g_transitions);
     }
-    ReleaseSRWLockExclusive(&g_transitions);
 }
 
 uint64_t freeze_table_hits() { return g_freeze_table_hits.load(std::memory_order_relaxed); }
@@ -994,7 +1073,10 @@ ImportFreeze::~ImportFreeze() {
     AcquireSRWLockExclusive(&g_transitions);
     for (const auto& r : runs_) {
         DWORD was = 0;
-        VirtualProtect(reinterpret_cast<void*>(r.first), static_cast<SIZE_T>(r.second - r.first), PAGE_READWRITE, &was);
+        if (VirtualProtect(reinterpret_cast<void*>(r.first), static_cast<SIZE_T>(r.second - r.first), PAGE_READWRITE, &was) &&
+            (r.second - r.first) / kPage <= kRecentRelMask + 1) {
+            for (uint64_t a = r.first; a < r.second; a += kPage) record_recent_release(a);
+        }
     }
     ReleaseSRWLockExclusive(&g_transitions);
     g_frz[slot_].hi.store(0, std::memory_order_seq_cst);
@@ -1035,8 +1117,10 @@ void before_os_write(const void* p, uint64_t n) {
             }
     }
     for_regions(reinterpret_cast<uint64_t>(p), n, [](Region* r, uint64_t first, uint64_t count) {
-        for (uint64_t q = first; q < first + count; ++q)
+        for (uint64_t q = first; q < first + count; ++q) {
             if (test(r->prot.get(), q)) release_page(r, q);
+            if (r->releasing[q].load(std::memory_order_seq_cst) != 0) wait_releasing(r, q, false);
+        }
     });
 }
 
@@ -1050,8 +1134,10 @@ void forget(uint64_t addr, uint64_t size, bool ban) {
                 VirtualProtect(reinterpret_cast<void*>(r->base + q * kPage), kPage, PAGE_READONLY, &was);
                 r->guard[q >> 6].fetch_and(~bit(q), std::memory_order_acq_rel);
             }
-        for (uint64_t q = first; q < first + count; ++q)           // armed pages go back to read-write (the caller may then set its own)
+        for (uint64_t q = first; q < first + count; ++q) {          // armed pages go back to read-write (the caller may then set its own)
             if (test(r->prot.get(), q)) release_page(r, q);
+            if (r->releasing[q].load(std::memory_order_seq_cst) != 0) wait_releasing(r, q, false);
+        }
         set_bits(r->valid.get(), first, count, false);
         set_bits(r->written.get(), first, count, true);
         r->has_written.store(true, std::memory_order_seq_cst);
@@ -1063,5 +1149,6 @@ void ban_section(uint64_t offset, uint64_t size) { forget(kHeapBase + offset, si
 
 uint64_t faults() { return g_faults.load(std::memory_order_relaxed); }
 uint64_t fault_waits() { return g_waits.load(std::memory_order_relaxed); }
+uint64_t virtual_queries() { return g_virtual_queries.load(std::memory_order_relaxed); }
 
 }  // namespace nxrt::mem::ww

@@ -552,3 +552,77 @@ NXTEST(import_freeze_rapid_cycles_with_concurrent_writers) {
     CHECK(writes.load() > 0);
     teardown(r);
 }
+
+NXTEST(concurrent_faults_with_overlapping_region_skip_virtual_query) {
+    mem::shutdown();
+    REQUIRE(mem::init() && mem::heap_create(kHeap) && mem::heap_commit(0, kPages * kPg));
+    // Whole-heap region published before the pool region (mirrors g_tex_ww + pool mirrors in NVN).
+    ww::Region* tex = ww::region_create(mem::kHeapBase, kHeap, "texture heap");
+    ww::Region* pool = ww::region_create(mem::kHeapBase, kPages * kPg, "pool mirror");
+    REQUIRE(tex != nullptr && pool != nullptr);
+    std::atomic<bool> stop{false};
+    std::atomic<int> failed{0};
+    const uint64_t faults0 = ww::faults();
+    const uint64_t vq0 = ww::virtual_queries();
+    std::vector<std::thread> ts;
+    for (int t = 0; t < 4; ++t)
+        ts.emplace_back([&, t] {
+            uint32_t n = static_cast<uint32_t>(t);
+            while (!stop.load(std::memory_order_relaxed)) {
+                for (uint64_t p = 0; p < 8; ++p)
+                    if (write_passes_or_faults(mem::kHeapBase + p * kPg + (n % 1024) * 4)) failed.fetch_add(1);
+                ++n;
+            }
+        });
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 3000 || (ww::faults() - faults0 < 10000 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)); ++i)
+        ww::arm(pool, 0, 8);
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& t : ts) t.join();
+    CHECK_EQ(failed.load(), 0);
+    CHECK(ww::faults() > faults0);
+    CHECK_EQ(ww::virtual_queries(), vq0);
+    ww::region_destroy(pool);
+    ww::region_destroy(tex);
+    mem::shutdown();
+}
+
+NXTEST(foreign_readonly_after_previous_release_passes_on) {
+    ww::Region* r = setup();
+    REQUIRE(r != nullptr);
+    REQUIRE(ww::arm(r, 10, 1));
+    CHECK(!write_passes_or_faults(mem::kHeapBase + 10 * kPg));   // armed page released and recorded in recent-release table
+    DWORD was = 0;
+    REQUIRE(VirtualProtect(reinterpret_cast<void*>(mem::kHeapBase + 10 * kPg), kPg, PAGE_READONLY, &was));   // foreign RO on same page
+    const uint64_t faults0 = ww::faults();
+    CHECK(write_passes_or_faults(mem::kHeapBase + 10 * kPg + 8));
+    CHECK(write_passes_or_faults(mem::kHeapBase + 10 * kPg + 16));
+    CHECK_EQ(ww::faults(), faults0);
+    CHECK_EQ(prot_of(mem::kHeapBase + 10 * kPg), static_cast<DWORD>(PAGE_READONLY));
+    teardown(r);
+}
+
+NXTEST(arm_with_concurrent_heap_epoch_bumps_avoids_virtual_query) {
+    ww::Region* r = setup();
+    REQUIRE(r != nullptr);
+    std::atomic<bool> stop{false};
+    std::thread churn([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            mem::heap_decommit(32 * kPg, 16 * kPg);
+            mem::heap_commit(32 * kPg, 16 * kPg);
+        }
+    });
+    const uint64_t vq0 = ww::virtual_queries();
+    int armed = 0;
+    for (int i = 0; i < 1000; ++i) {
+        if (ww::arm(r, 0, 8)) {
+            ++armed;
+            *reinterpret_cast<volatile uint32_t*>(mem::kHeapBase + static_cast<uint64_t>(i % 8) * kPg) = static_cast<uint32_t>(i);
+        }
+    }
+    stop.store(true, std::memory_order_relaxed);
+    churn.join();
+    CHECK(armed > 0);
+    CHECK_EQ(ww::virtual_queries(), vq0);
+    teardown(r);
+}

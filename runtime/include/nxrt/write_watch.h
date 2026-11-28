@@ -133,5 +133,6 @@ uint64_t guard_faults();   // accesses that hit a guarded page (statistics)
 
 uint64_t faults();     // write faults handled so far (statistics)
 uint64_t fault_waits(); // rounds a fault spent waiting for another thread's release of the same page (statistics; stays 0 for foreign faults)
+uint64_t virtual_queries(); // VirtualQuery calls made by fault/arm/freeze slow paths (statistics, tests)
 
 }  // namespace nxrt::mem::ww

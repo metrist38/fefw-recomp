@@ -999,7 +999,7 @@ struct Mirror {
     // before, without write tracking, and serve that submission's binds only.
     std::vector<uint64_t> tv;           // bitmap: the page holds such a copy for the submission being recorded
     std::vector<uint32_t> tv_list;      // the pages with a tv bit (cleared at the next submission start)
-    std::vector<uint8_t> sig;           // per page: bit i = a bind read it from host memory (or from its copy) in the i-th submission of a frame
+    std::vector<uint32_t> sig;          // per page: bit i = a bind read it from host memory (or from its copy) in the i-th submission of a frame (up to 32)
     std::vector<uint32_t> sig_pages;    // the pages with a non-zero sig
     std::vector<uint32_t> copied_at;    // present count of the last copy (0: never)
     std::vector<uint64_t> used;         // bitmap: a draw read the page from the copy since it was copied
@@ -1098,10 +1098,10 @@ void erase_mirror_from_lists(Mirror* m) {
     if (m->in_want_list) { g_want_mirrors.erase(std::remove(g_want_mirrors.begin(), g_want_mirrors.end(), m), g_want_mirrors.end()); m->in_want_list = false; }
 }
 
-// Arming budget of one submission ([nvn] mirror_arm_ms, default 3; 0 = no limit). Each arm is a VirtualQuery walk and a VirtualProtect; while
-// the game streams an area they took the render thread up to 490 ms a frame (hitch line "write-watch arming"). Past the budget no page is
-// armed or copied in this submission: draws read those pages from the pool itself (always current), and the copies wait for the next
-// submissions. Render thread.
+// Arming budget per presented frame during paced gameplay, or per submission during unpaced area loads ([nvn] mirror_arm_ms, default 3;
+// 0 = no limit). Each arm is a VirtualProtect under g_transitions exclusive; while the game streams an area they took the render thread
+// up to 490 ms a frame (hitch line "write-watch arming"). Past the budget no page is armed or copied until the next frame: draws read
+// those pages from the pool itself (always current), and the copies wait for the next frame. Render thread.
 int64_t g_arm_spent_ns = 0;
 std::atomic<uint64_t> g_st_arm_deferred{0};
 std::atomic<uint64_t> g_st_chunk_bytes_made{0};   // video memory of the copy chunks made, ever (the hitch line: new chunks during a slow frame)
@@ -1712,7 +1712,7 @@ BufRef resolve_read(uint64_t gpu_address, uint64_t size, int use, bool* from_mir
             }
         }
         if (hot_copy_on()) {
-            const uint8_t sb = static_cast<uint8_t>(1u << std::min<uint32_t>(g_sub_idx, 7));
+            const uint32_t sb = uint32_t{1} << std::min<uint32_t>(g_sub_idx, 31);
             if (!m->sig_pages.empty()) {
                 for (uint64_t p = first; p <= last; ++p)
                     if (m->sig[static_cast<size_t>(p)]) m->sig[static_cast<size_t>(p)] |= sb;
@@ -1740,9 +1740,9 @@ BufRef resolve_read(uint64_t gpu_address, uint64_t size, int use, bool* from_mir
         g_host_why[use][w]++;
     }
     if (hot_copy_on()) {
-        const uint8_t sb = static_cast<uint8_t>(1u << std::min<uint32_t>(g_sub_idx, 7));
+        const uint32_t sb = uint32_t{1} << std::min<uint32_t>(g_sub_idx, 31);
         for (uint64_t p = first; p <= last; ++p) {
-            uint8_t& sg = m->sig[static_cast<size_t>(p)];
+            uint32_t& sg = m->sig[static_cast<size_t>(p)];
             if (!sg) {
                 m->sig_pages.push_back(static_cast<uint32_t>(p));
                 mark_sig_mirror(*m);
@@ -1891,7 +1891,8 @@ void mirror_begin_submit(Frame& f, bool on) {
     g_mirror_clock_ms = mirror_clock_now();
     log_summary(now);
     ++g_want_fate[6];
-    if (now != g_sub_last_present) { g_sub_last_present = now; g_sub_idx = 0; } else if (g_sub_idx < 255) ++g_sub_idx;
+    const bool new_present = now != g_sub_last_present;
+    if (new_present) { g_sub_last_present = now; g_sub_idx = 0; } else if (g_sub_idx < 255) ++g_sub_idx;
 
     // Pass 1: clear per-submission hot-copy bits only on mirrors that actually had hot copies.
     for (Mirror* mp0 : g_tv_mirrors) {
@@ -1935,11 +1936,12 @@ void mirror_begin_submit(Frame& f, bool on) {
 
     uint64_t budget = kCopyBudget;
     bool barrier_done = false;
-    g_arm_spent_ns = 0;          // the arming budget is per submission (mirror_fill and mirror_span_written during recording count too)
+    // Per-frame arming budget during paced gameplay (frames can have 15+ submissions); per-submission during unpaced loads.
+    if (new_present || nxrt::frame_limiter_loading()) g_arm_spent_ns = 0;
 
     // Pass 3: hot-copy snapshots, visiting only mirrors with active sig_pages.
     if (hot_copy_on() && !g_sig_mirrors.empty()) {
-        const uint8_t sb = static_cast<uint8_t>(1u << std::min<uint32_t>(g_sub_idx, 7));
+        const uint32_t sb = uint32_t{1} << std::min<uint32_t>(g_sub_idx, 31);
         static std::vector<uint64_t> cand;
         size_t keep_m = 0;
         for (Mirror* mp : g_sig_mirrors) {
