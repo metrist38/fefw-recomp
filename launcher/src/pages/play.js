@@ -136,6 +136,8 @@ export async function render(el, ctx) {
   let logOpen = false;
   let guideOpen = false;
   let closeBrowseMenu = null;
+  let pathSeq = 0;
+  let saveInFlight = 0;
 
   function shutBrowseMenu() {
     if (closeBrowseMenu) closeBrowseMenu();
@@ -165,15 +167,18 @@ export async function render(el, ctx) {
   }
 
   async function importNup(picked) {
+    const seq = ++pathSeq;
     nupBusy = true;
     nupProgress = null;
     draw();
     try {
       const unpacked = await api('import_nup', { path: picked });
+      if (seq !== pathSeq || el.dataset.visit !== visit) return;
       nupBusy = false;
       await applyPath(unpacked);
       return;
     } catch (e) {
+      if (seq !== pathSeq || el.dataset.visit !== visit) return;
       toast(errText(e), 'error');
     }
     nupBusy = false;
@@ -181,29 +186,41 @@ export async function render(el, ctx) {
   }
 
   async function applyPath(next) {
-    const trimmed = (next || '').trim();
-    if (/\.nup$/i.test(trimmed)) {
-      await importNup(trimmed);
+    const nextPath = (next || '').trim();
+    if (/\.nup$/i.test(nextPath)) {
+      await importNup(nextPath);
       return;
     }
-    path = trimmed;
-    report = path && ov.repo_ok
-      ? await api('validate_dump', { path }).catch((e) => ({ errors: [errText(e)], candidates: [], chosen: null }))
+    const seq = ++pathSeq;
+    const nextReport = nextPath && ov.repo_ok
+      ? await api('validate_dump', { path: nextPath }).catch((e) => ({ errors: [errText(e)], candidates: [], chosen: null }))
       : null;
+    if (seq !== pathSeq || el.dataset.visit !== visit) return;
+    path = nextPath;
+    report = nextReport;
     const running = !!(setup && setup.progress.state === 'running');
-    if (report && report.chosen && path !== saved && !running) {
+    if (nextReport && nextReport.chosen && !running && (nextPath !== saved || saveInFlight > 0)) {
+      saveInFlight++;
       try {
-        await api('save_dump', { path });
-        saved = report.path || path;
-        path = saved;
-        [setup, ov] = await Promise.all([api('setup_status'), api('get_overview')]);
+        const savedReport = await api('save_dump', { path: nextPath });
+        if (seq !== pathSeq || el.dataset.visit !== visit) return;
+        const canonical = (savedReport && savedReport.path) || nextReport.path || nextPath;
+        saved = canonical;
+        path = canonical;
+        report = savedReport || nextReport;
+        const [nextSetup, nextOv] = await Promise.all([api('setup_status'), api('get_overview')]);
+        if (seq !== pathSeq || el.dataset.visit !== visit) return;
+        setup = nextSetup;
+        ov = nextOv;
         if (setup) log = setup.log.slice();
         toast(t(setup && setup.complete ? 'play.filesReady' : 'setup.filesSaved'), 'ok');
       } catch (e) {
-        toast(errText(e), 'error');
+        if (seq === pathSeq && el.dataset.visit === visit) toast(errText(e), 'error');
+      } finally {
+        saveInFlight--;
       }
     }
-    draw();
+    if (seq === pathSeq && el.dataset.visit === visit) draw();
   }
 
   function openBrowseMenu(button, input) {
@@ -393,11 +410,12 @@ export async function render(el, ctx) {
     shutBrowseMenu();
     const running = status.state === 'running';
     const chosen = report && report.chosen;
+    const savedMatch = saved === path;
     const setupRunning = !!(setup && setup.progress.state === 'running');
     const missingTools = setup && !setup.package ? setup.tools.filter((x) => !x.ok) : [];
-    const ready = !!(ov.repo_ok && chosen && setup && setup.complete && !setupRunning && !nupBusy && !setup.cpu_problem);
+    const ready = !!(ov.repo_ok && chosen && savedMatch && setup && setup.complete && !setupRunning && !nupBusy && !setup.cpu_problem);
     const setupVisible = ov.repo_ok && (!ready || showSetup);
-    const rebuildBanner = ov.repo_ok && chosen && setup && !setup.complete && ov.exe_exists && !setup.cpu_problem;
+    const rebuildBanner = ov.repo_ok && chosen && savedMatch && setup && !setup.complete && ov.exe_exists && !setup.cpu_problem;
 
     el.innerHTML = `
       <div class="page">
