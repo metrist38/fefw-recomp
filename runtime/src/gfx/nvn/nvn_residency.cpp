@@ -223,10 +223,12 @@ void residency_begin_submit(Frame& f) {
         tex_residency_tick(f);   // nvn_gpu_texture.cpp: failed images retried; demote idle ones under pressure
         if (gpass_on()) gpass_stamp(f, "residency tick", 0);
     }
-    // the first submission of each present (a frame has several): restore the demoted textures seen again, within the budget
-    if (residency_on() && now != last_restore) {
+    // the first submission of each present (a frame has several): restore demoted textures seen again, and pre-upload prepared
+    // textures while a loading screen is showing
+    if (now != last_restore) {
         last_restore = now;
-        tex_residency_restore(f);
+        if (residency_on()) tex_residency_restore(f);
+        tex_load_uploads(f);   // [nvn] load_uploads_ms: textures uploaded during loading screens
     }
 }
 
