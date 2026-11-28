@@ -354,10 +354,11 @@ NXTEST(destroy_and_recreate_while_writers_fault) {
 
 namespace {
 std::atomic<bool> delayed_entered{false}, delayed_resume{false};
+std::atomic<uint64_t> delayed_addr{0};
 LONG CALLBACK delay_write_fault(EXCEPTION_POINTERS* ep) {
     auto* e = ep->ExceptionRecord;
     if (e->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && e->NumberParameters >= 2 &&
-        e->ExceptionInformation[1] == mem::kHeapBase) {
+        e->ExceptionInformation[1] == delayed_addr.load(std::memory_order_acquire)) {
         delayed_entered.store(true);
         while (!delayed_resume.load()) YieldProcessor();
     }
@@ -368,6 +369,7 @@ NXTEST(fault_delivered_after_last_region_destroyed) {
     auto* r = setup();
     REQUIRE(r != nullptr);
     REQUIRE(ww::arm(r, 0, 1));
+    delayed_addr.store(mem::kHeapBase, std::memory_order_release);
     delayed_entered.store(false); delayed_resume.store(false);
     auto veh = AddVectoredExceptionHandler(1, delay_write_fault);
     REQUIRE(veh != nullptr);
@@ -629,11 +631,18 @@ NXTEST(arm_with_concurrent_heap_epoch_bumps_avoids_virtual_query) {
 
 NXTEST(delayed_writes_survive_repeated_recent_release_evictions) {
     mem::shutdown();
-    constexpr uint64_t kCollisionPage = 1025;   // shares recent_slot() with page 0 on 4 GiB-aligned kHeapBase
+    // Use a page well above earlier tests' retired pages (e.g. region_table_grows_and_reuses_slots uses 0..1536) so
+    // g_retired is clear and evicted faults must go through heap_write_landed_late(), not retired_retry().
+    // On 4 GiB-aligned kHeapBase, pages 2048 and 3073 hash to the same recent_slot() ((2048^2)&1023 == (3073^3)&1023 == 2).
+    constexpr uint64_t kTargetPage = 2048;
+    constexpr uint64_t kCollisionPage = kTargetPage + 1025;
     constexpr uint64_t kTestPages = kCollisionPage + 1;
+    const uint64_t target_addr = mem::kHeapBase + kTargetPage * kPg;
     REQUIRE(mem::init() && mem::heap_create(kHeap) && mem::heap_commit(0, kTestPages * kPg));
+    REQUIRE(ww::describe_page(target_addr).find("retired-page history=1") == std::string::npos);
     ww::Region* r = ww::region_create(mem::kHeapBase, kTestPages * kPg);
     REQUIRE(r != nullptr);
+    delayed_addr.store(target_addr, std::memory_order_release);
     auto veh = AddVectoredExceptionHandler(1, delay_write_fault);
     REQUIRE(veh != nullptr);
     std::atomic<int> round{0}, done{0}, failed{0};
@@ -641,19 +650,19 @@ NXTEST(delayed_writes_survive_repeated_recent_release_evictions) {
     std::thread writer([&] {
         for (int i = 1; i <= kRounds; ++i) {
             while (round.load(std::memory_order_acquire) != i) YieldProcessor();
-            if (write_passes_or_faults(mem::kHeapBase)) failed.fetch_add(1, std::memory_order_relaxed);
+            if (write_passes_or_faults(target_addr)) failed.fetch_add(1, std::memory_order_relaxed);
             done.store(i, std::memory_order_release);
         }
     });
     for (int i = 1; i <= kRounds; ++i) {
-        REQUIRE(ww::arm(r, 0, 1));
+        REQUIRE(ww::arm(r, kTargetPage, 1));
         REQUIRE(ww::arm(r, kCollisionPage, 1));
         delayed_entered.store(false, std::memory_order_relaxed);
         delayed_resume.store(false, std::memory_order_relaxed);
         round.store(i, std::memory_order_release);
         while (!delayed_entered.load(std::memory_order_acquire)) YieldProcessor();
-        // Release page 0, then release the colliding page to evict page 0 from g_recent_rel before writer resumes.
-        *reinterpret_cast<volatile uint32_t*>(mem::kHeapBase + 4) = static_cast<uint32_t>(i);
+        // Release target page, then release the colliding page to evict target page from g_recent_rel before writer resumes.
+        *reinterpret_cast<volatile uint32_t*>(target_addr + 4) = static_cast<uint32_t>(i);
         *reinterpret_cast<volatile uint32_t*>(mem::kHeapBase + kCollisionPage * kPg) = static_cast<uint32_t>(i);
         delayed_resume.store(true, std::memory_order_release);
         while (done.load(std::memory_order_acquire) != i) YieldProcessor();
