@@ -37,7 +37,8 @@ bool backend_installed();
 void backend_flush_caches();
 // Shows the game's last frame again (with the overlay on top) when the game has not presented for 50 ms and no present is queued. For while
 // the game waits on the player in a library applet (the on-screen keyboard) and presents nothing. Any thread; does not wait.
-void present_last_frame_again();
+// Returns true when a re-present was queued, false when nothing was queued (no frame yet, one already pending, or within 50 ms of the last).
+bool present_last_frame_again();
 
 // Traces the next whole presented frame like [nvn] trace_frame (the scripted `@shot nvntrace_<name>` calls this).
 void backend_trace_next_frame();

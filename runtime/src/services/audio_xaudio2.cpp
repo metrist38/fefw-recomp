@@ -254,20 +254,25 @@ bool XAudio2Sink::open(uint32_t sample_rate, uint32_t channels) {
     starved_.store(false);
     submitted_frames_.store(0);
     callback_.owner = this;
-    hr = engine_->CreateSourceVoice(&source_, &wfx.Format, 0, XAUDIO2_DEFAULT_FREQ_RATIO, &callback_, nullptr, nullptr);
+    IXAudio2SourceVoice* created = nullptr;
+    hr = engine_->CreateSourceVoice(&created, &wfx.Format, 0, XAUDIO2_DEFAULT_FREQ_RATIO, &callback_, nullptr, nullptr);
     if (FAILED(hr)) {
         NXLOG_W("audio", "xaudio2: CreateSourceVoice(%u Hz, %u ch) failed (0x%08lx)", sample_rate, channels,
                 static_cast<unsigned long>(hr));
         teardown();
         return false;
     }
-    if (!(paused_.load(std::memory_order_acquire) || audio::paused())) {
-        hr = source_->Start(0);
-        if (FAILED(hr)) {
-            NXLOG_W("audio", "xaudio2: source voice Start failed (0x%08lx)", static_cast<unsigned long>(hr));
-            teardown();
-            return false;
+    {
+        std::lock_guard<std::mutex> vl(voice_mu_);
+        source_ = created;
+        if (!(paused_.load(std::memory_order_acquire) || audio::paused())) {
+            hr = source_->Start(0);
         }
+    }
+    if (FAILED(hr)) {
+        NXLOG_W("audio", "xaudio2: source voice Start failed (0x%08lx)", static_cast<unsigned long>(hr));
+        teardown();
+        return false;
     }
     applied_volume_ = std::min(effective_volume(), 1.0f);
     source_->SetVolume(applied_volume_);
@@ -293,8 +298,8 @@ void XAudio2Sink::close() {
 }
 
 void XAudio2Sink::set_paused(bool paused) {
-    paused_.store(paused, std::memory_order_release);
     std::lock_guard<std::mutex> vl(voice_mu_);
+    paused_.store(paused, std::memory_order_release);
     if (!source_) return;
     if (paused) source_->Stop(0);
     else source_->Start(0);

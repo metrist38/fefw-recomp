@@ -701,7 +701,7 @@ void poll_pads(uint64_t now) {
     const size_t n = input::gamepad_list(infos, 8);
     bool have_six = false;
     uint16_t lo = 0, hi = 0;
-    {
+    if (!kernel::is_paused()) {
         const float l = std::max(st.vib[0][0].load(), st.vib[1][0].load()), h = std::max(st.vib[0][1].load(), st.vib[1][1].load());
         map_rumble(l, h, st.settings.pad, &lo, &hi);
         // 16 levels: the game changes the amplitude a little almost every frame in battle, and a report per frame over Bluetooth backs up
@@ -953,6 +953,23 @@ int update_hook(::Ctx*, uint64_t, void*) {
         st.engine->release_all(now);
         kernel::set_paused(true, GetCurrentThreadId());
         audio::set_paused(true);
+        // Silence any active rumble/haptics so controllers do not keep buzzing while the guest is paused.
+        st.vib[0][0].store(0.f);
+        st.vib[0][1].store(0.f);
+        st.vib[1][0].store(0.f);
+        st.vib[1][1].store(0.f);
+        haptic::push(0, 0, 0.f, 0.f, 0.f, 0.f);
+        haptic::push(0, 1, 0.f, 0.f, 0.f, 0.f);
+        {
+            input::GamepadInfo pads[8];
+            const size_t np = input::gamepad_list(pads, 8);
+            for (size_t i = 0; i < np; ++i) {
+                if (haptic::legacy_rumble(pads[i].id)) platform::gamepad_rumble(pads[i].id, 0, 0, 0);
+            }
+            st.rumble_lo = 0;
+            st.rumble_hi = 0;
+            st.last_rumble_ns = now;
+        }
         st.limiter.reset_schedule();
         if (st.window) {
             if (platform::relative_mouse()) platform::set_relative_mouse(false);
@@ -979,8 +996,7 @@ int update_hook(::Ctx*, uint64_t, void*) {
             const uint64_t t_ms = SDL_GetTicks();
             if (t_ms - last_present_ms >= 16) {
                 last_present_ms = t_ms;
-                if (st.window && platform::minimized()) diag_frame_tick();
-                else nvn::present_last_frame_again();
+                if ((st.window && platform::minimized()) || !nvn::present_last_frame_again()) diag_frame_tick();
             }
             Sleep(4);
         }

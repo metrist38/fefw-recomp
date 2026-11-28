@@ -23,6 +23,44 @@ uint64_t raw_qpc() {
     QueryPerformanceCounter(&c);
     return static_cast<uint64_t>(c.QuadPart);
 }
+
+uint64_t qpc_freq() {
+    static const uint64_t freq = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return static_cast<uint64_t>(f.QuadPart);
+    }();
+    return freq;
+}
+
+bool is_pause_owner() {
+    const uint32_t owner = g_pause_owner_tid.load(std::memory_order_relaxed);
+    return owner != 0 && GetCurrentThreadId() == owner;
+}
+
+uint64_t guest_qpc() {
+    for (;;) {
+        const uint64_t s1 = g_pause_seq.load(std::memory_order_acquire);
+        if (s1 & 1u) {
+            AcquireSRWLockShared(&g_pause_lock);
+            const uint64_t q = g_paused.load(std::memory_order_relaxed) ? g_pause_start_qpc.load(std::memory_order_relaxed) : raw_qpc();
+            const uint64_t off = g_paused_qpc_total.load(std::memory_order_relaxed);
+            ReleaseSRWLockShared(&g_pause_lock);
+            return q > off ? q - off : 0;
+        }
+        const uint64_t off = g_paused_qpc_total.load(std::memory_order_relaxed);
+        const uint64_t q = raw_qpc();
+        if (g_pause_seq.load(std::memory_order_seq_cst) == s1) {
+            return q > off ? q - off : 0;
+        }
+    }
+}
+
+uint64_t guest_ns() {
+    const uint64_t v = guest_qpc();
+    const uint64_t freq = qpc_freq();
+    return (v / freq) * 1000000000ull + (v % freq) * 1000000000ull / freq;
+}
 }  // namespace
 
 void set_paused(bool paused, uint32_t owner_tid) {
@@ -53,8 +91,7 @@ bool is_paused() { return g_paused.load(std::memory_order_acquire); }
 
 void wait_if_paused() {
     if (!g_paused.load(std::memory_order_acquire)) return;
-    const uint32_t owner = g_pause_owner_tid.load(std::memory_order_relaxed);
-    if (owner != 0 && GetCurrentThreadId() == owner) return;
+    if (is_pause_owner()) return;
     AcquireSRWLockExclusive(&g_pause_lock);
     while (g_paused.load(std::memory_order_acquire)) {
         SleepConditionVariableSRW(&g_pause_cv, &g_pause_lock, INFINITE, 0);
@@ -69,29 +106,8 @@ uint64_t tick_hz() {
 
 uint64_t system_tick() {
     if (uint64_t vt; tt::virtual_tick(&vt)) return vt;      // deterministic mode: the virtual clock (test tooling)
-    static const uint64_t freq = [] {
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        return static_cast<uint64_t>(f.QuadPart);
-    }();
-    uint64_t v = 0;
-    for (;;) {
-        const uint64_t s1 = g_pause_seq.load(std::memory_order_acquire);
-        if (s1 & 1u) {
-            AcquireSRWLockShared(&g_pause_lock);
-            const uint64_t q = g_paused.load(std::memory_order_relaxed) ? g_pause_start_qpc.load(std::memory_order_relaxed) : raw_qpc();
-            const uint64_t off = g_paused_qpc_total.load(std::memory_order_relaxed);
-            v = q > off ? q - off : 0;
-            ReleaseSRWLockShared(&g_pause_lock);
-            break;
-        }
-        const uint64_t off = g_paused_qpc_total.load(std::memory_order_relaxed);
-        const uint64_t q = raw_qpc();
-        if (g_pause_seq.load(std::memory_order_seq_cst) == s1) {
-            v = q > off ? q - off : 0;
-            break;
-        }
-    }
+    const uint64_t freq = qpc_freq();
+    const uint64_t v = guest_qpc();
     const uint64_t hz = tick_hz();
     return (v / freq) * hz + (v % freq) * hz / freq;     // split so the multiplication cannot overflow
 }
@@ -135,22 +151,27 @@ void sleep_once(int64_t ns) {
 
 // On the thread set_blocked_hook names, a sleep longer than 10 ms is cut into 10 ms slices with the hook run between them, as in the kernel
 // waits: Pokopia's main thread sleeps in SleepThread while the software keyboard applet is open (the freeze report's main stack).
+// Longer sleeps track their deadline on guest_ns() so a runtime pause preserves the remaining sleep duration on resume.
 void sleep_ns(int64_t ns) {
     if (tt::virtual_sleep(ns)) return;                      // deterministic mode: time advances, the thread only yields
+    if (ns <= 200000) return sleep_once(ns);
+    if (is_paused() && is_pause_owner()) return sleep_once(ns);
     constexpr int64_t kSlice = 10000000;
     void (*fn)() = ns > kSlice ? detail::blocked_hook_here() : nullptr;
-    if (!fn) return sleep_once(ns);
-    const auto qpc_ns = [] {
-        LARGE_INTEGER f, c;
-        QueryPerformanceFrequency(&f);
-        QueryPerformanceCounter(&c);
-        return static_cast<int64_t>(c.QuadPart / f.QuadPart * 1000000000 + c.QuadPart % f.QuadPart * 1000000000 / f.QuadPart);
-    };
-    const int64_t until = qpc_ns() + ns;
-    for (int64_t rem = ns; rem > 0; rem = until - qpc_ns()) {
-        if (rem <= kSlice) return sleep_once(rem);
-        sleep_once(kSlice);
-        fn();
+    const uint64_t until = guest_ns() + static_cast<uint64_t>(ns);
+    for (;;) {
+        wait_if_paused();
+        const uint64_t now = guest_ns();
+        if (now >= until) return;
+        const int64_t rem = static_cast<int64_t>(until - now);
+        if (fn && rem > kSlice) {
+            sleep_once(kSlice);
+            fn();
+        } else {
+            sleep_once(rem);
+            if (fn && guest_ns() < until) fn();
+        }
+        if (is_paused() && is_pause_owner()) return;
     }
 }
 

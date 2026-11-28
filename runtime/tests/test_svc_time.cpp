@@ -696,3 +696,35 @@ NXTEST(kernel_pause_freezes_system_tick_and_blocks_other_threads) {
     const uint64_t delta_ms = (t_after - t_frozen_1) * 1000ull / kernel::tick_hz();
     CHECK(delta_ms < 40);
 }
+
+NXTEST(kernel_sleep_preserves_remaining_time_across_pause) {
+    CHECK(!kernel::is_paused());
+    std::atomic<bool> started{false};
+    std::atomic<bool> done{false};
+    uint64_t guest_elapsed_ms = 0;
+    int64_t wall_elapsed_ms = 0;
+
+    std::thread worker([&] {
+        const auto w0 = std::chrono::steady_clock::now();
+        const uint64_t g0 = kernel::system_tick();
+        started.store(true, std::memory_order_release);
+        kernel::sleep_ns(120'000'000);   // 120 ms guest sleep
+        const uint64_t g1 = kernel::system_tick();
+        const auto w1 = std::chrono::steady_clock::now();
+        guest_elapsed_ms = (g1 - g0) * 1000ull / kernel::tick_hz();
+        wall_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(w1 - w0).count();
+        done.store(true, std::memory_order_release);
+    });
+
+    while (!started.load(std::memory_order_acquire)) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    kernel::set_paused(true, GetCurrentThreadId());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(!done.load(std::memory_order_acquire));
+    kernel::set_paused(false);
+    worker.join();
+
+    CHECK(done.load(std::memory_order_acquire));
+    CHECK(guest_elapsed_ms >= 100);
+    CHECK(wall_elapsed_ms >= 180);
+}

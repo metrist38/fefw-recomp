@@ -461,6 +461,6 @@ void pool_copy_end();
 
 // ---- present -----------------------------------------------------------------------------------------------------------
 void present_on_render_thread(Window* w, int index, bool again = false);   // again: present_again (not counted as a game present)
-void present_again();
+bool present_again();
 
 }  // namespace nxrt::nvn::be::gpu

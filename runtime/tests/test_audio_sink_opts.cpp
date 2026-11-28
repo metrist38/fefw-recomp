@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // The audio sink options: the WAV writer and the tee sink behind [audio] wav_dump (src/services/audio_wav.cpp), the master volume
 // and the output device listing (src/services/audio_devices.cpp). No real output device is opened here.
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -9,6 +10,7 @@
 #include <iterator>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "nxrt/audio_sink.h"
@@ -297,4 +299,25 @@ NXTEST(pause_propagates_to_sink_and_wav_tee) {
 
     nxrt::audio::set_sink(std::make_shared<nxrt::audio::NullSink>());
     std::filesystem::remove(path);
+}
+
+NXTEST(paced_sink_pauses_without_draining_or_underrun) {
+    auto paced = nxrt::audio::make_paced_sink(0.0);
+    REQUIRE(paced->open(kRate, 2));
+    const std::vector<int16_t> silence(2400 * 2, 0);   // 50 ms at 48 kHz
+    CHECK_EQ(paced->write(silence.data(), 2400), 2400u);
+
+    paced->set_paused(true);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(paced->queued_frames() > 1200u);
+    CHECK_EQ(paced->stats().underruns, 0ull);
+
+    paced->set_paused(false);
+    CHECK(paced->queued_frames() > 1200u);
+    CHECK_EQ(paced->stats().underruns, 0ull);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    CHECK_EQ(paced->queued_frames(), 0u);
+    CHECK(paced->stats().underruns >= 1ull);
+    paced->close();
 }
