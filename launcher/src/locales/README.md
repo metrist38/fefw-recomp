@@ -1,7 +1,7 @@
 # Launcher language packs
 
-The launcher ships with built-in English and Simplified Chinese. Additional
-languages are plain JSON files in a `locales` folder next to `fefw-launcher.exe`:
+The launcher ships with built-in English and Simplified Chinese, and an Arabic pack
+(`launcher/locales/ar.json`). Additional languages are plain JSON files in a `locales` folder next to `fefw-launcher.exe`:
 
 ```
 fefw-launcher.exe

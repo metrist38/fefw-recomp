@@ -488,6 +488,81 @@ NXTEST(swkbdui_ask_answer) {
     CHECK(sk::pending(nullptr) == 0);
 }
 
+// Rejected-name retry with swkbd_display_order enabled: the text sent to the game's text check is in display order,
+// but when the game rejects it, the reopened keyboard keeps the player's editable reading-order text (for both Hebrew,
+// which has no presentation forms, and Arabic).
+NXTEST(am_swkbd_display_order_retry_keeps_reading_order) {
+    namespace sk = services::swkbdui;
+    nxsvc::Env env;
+    clear_config();
+    config_set("applet", "swkbd_display_order", "true");
+    sk::enable_prompt(true);
+    auto wait_open = [](uint64_t after) {
+        uint64_t id = 0;
+        for (int i = 0; i < 5000; ++i) {
+            id = sk::pending(nullptr);
+            if (id && id != after) return id;
+            Sleep(1);
+        }
+        return uint64_t{0};
+    };
+    nxsvc::Session proxy = open_proxy();
+    REQUIRE(proxy.valid());
+    nxsvc::Session creator = proxy.sub(proxy.call(11));
+    REQUIRE(creator.valid());
+    nxsvc::Session kb = creator.sub(creator.call(0, nxsvc::Args().u32(0x11).u32(0)));
+    REQUIRE(kb.valid());
+    std::vector<uint8_t> common(0x20, 0), cfg(0x530, 0);
+    const uint32_t version = 0x140010, max_len = 16;
+    std::memcpy(common.data() + 8, &version, 4);
+    std::memcpy(cfg.data() + 0x3AC, &max_len, 4);
+    cfg[0x3AA] = 1;                                   // use_utf8
+    cfg[0x48D] = 1;                                   // use_text_check
+    CHECK_EQ(kb.call(100, nxsvc::Args().hmove(make_storage(creator, common))).result, 0u);
+    CHECK_EQ(kb.call(100, nxsvc::Args().hmove(make_storage(creator, cfg))).result, 0u);
+    CHECK_EQ(kb.call(10).result, 0u);
+
+    // First attempt: Hebrew in reading order ("שלום").
+    const std::string hebrew = "\xD7\xA9\xD7\x9C\xD7\x95\xD7\x9D";
+    const std::string hebrew_disp = "\xD7\x9D\xD7\x95\xD7\x9C\xD7\xA9";
+    const uint64_t id1 = wait_open(0);
+    REQUIRE(id1 != 0);
+    sk::answer(id1, true, hebrew);
+    {
+        nxsvc::Reply check;
+        for (int i = 0; i < 5000; ++i) {
+            check = kb.call(104);
+            if (check.ok()) break;
+            Sleep(1);
+        }
+        REQUIRE(check.ok());
+        nxsvc::Session cs = kb.sub(check);
+        nxsvc::Session acc = cs.sub(cs.call(0));
+        uint8_t buf[32] = {0};
+        CHECK_EQ(acc.call(11, nxsvc::Args().i64(0).buf_b(buf, sizeof buf)).result, 0u);
+        CHECK(std::string(reinterpret_cast<const char*>(buf + 8)) == hebrew_disp);
+    }
+
+    // Reject the name (SwkbdTextCheck::Failure = 1): the reopened prompt must still hold reading-order Hebrew.
+    std::vector<uint8_t> reject(0x7D8, 0);
+    reject[0] = 1;
+    CHECK_EQ(kb.call(103, nxsvc::Args().hmove(make_storage(creator, reject))).result, 0u);
+    const uint64_t id2 = wait_open(id1);
+    REQUIRE(id2 != 0);
+    sk::Request seen;
+    CHECK(sk::pending(&seen) == id2);
+    CHECK(seen.initial == hebrew);
+
+    // Cancel to finish the applet cleanly.
+    sk::answer(id2, false, "");
+    for (int i = 0; i < 5000; ++i) {
+        if (kb.call(101).ok()) break;
+        Sleep(1);
+    }
+    sk::enable_prompt(false);
+    clear_config();
+}
+
 NXTEST(am_desired_language) {
     nxsvc::Env env;
     clear_config();

@@ -35,6 +35,17 @@ inline std::vector<std::string> menu_language_candidates(const std::string& tag)
     return out;
 }
 
+// A right-to-left language (Arabic, Persian, Urdu, Hebrew): its table is turned into display order at load (nxrt/rtl_text.h) and
+// its wrapped help is laid out by text_wrapped.
+inline bool menu_language_is_rtl(const std::string& lang) {
+    std::string p;
+    for (const char c : lang) {
+        if (c == '-' || c == '_') break;
+        p.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    return p == "ar" || p == "fa" || p == "ur" || p == "he" || p == "iw";
+}
+
 // The table [gfx] ui_language asks for, "" for the built-in English: the named one, or for "auto" the first table present that
 // suits the Windows display language.
 std::string menu_language();
@@ -48,4 +59,12 @@ const char* menu_translation_problem(const std::string& key, const std::string& 
 // Load the table for [gfx] ui_language. Called once from the overlay's font setup; safe to call again (reloads).
 void menu_i18n_init();
 
+// ImGui::TextWrapped for menu text: right-to-left text (display order, as tr() returns it) is broken into lines from its reading
+// start and each line is set against the right edge; other text is passed to ImGui::TextWrapped as it is. (src/gfx/menu_i18n_ui.cpp)
+void text_wrapped(const char* fmt, ...);
+void text_wrapped_disabled(const char* fmt, ...);   // the same in the disabled text colour
+
+// In a right-to-left table, why a line must not be used (two format specifiers with right-to-left words between them would swap
+// places when laid out), or nullptr.
+const char* menu_rtl_problem(const std::string& value);
 } // namespace nxrt::gfx

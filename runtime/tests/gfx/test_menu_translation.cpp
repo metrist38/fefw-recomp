@@ -36,3 +36,12 @@ NXTEST(percent_n_is_refused_in_every_spelling) {
     CHECK(!accepted("off", "% n"));
     CHECK(!accepted("off", "%- n"));
 }
+
+NXTEST(rtl_tables_keep_two_specifiers_together) {
+    // an Arabic table is laid out right to left: words between two conversions would swap printf's arguments
+    CHECK(nxrt::gfx::menu_rtl_problem("الإطارات: %d / %d") == nullptr);
+    CHECK(nxrt::gfx::menu_rtl_problem("تم حفظ %s بنجاح") == nullptr);
+    CHECK(nxrt::gfx::menu_rtl_problem("القيمة %d%%") == nullptr);
+    CHECK(nxrt::gfx::menu_rtl_problem("%d من %d") != nullptr);
+    CHECK(nxrt::gfx::menu_language_is_rtl("ar") && nxrt::gfx::menu_language_is_rtl("fa-IR") && !nxrt::gfx::menu_language_is_rtl("zh"));
+}

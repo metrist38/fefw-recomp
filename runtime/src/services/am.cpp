@@ -21,6 +21,7 @@
 #include "nxrt/kernel.h"
 #include "nxrt/log.h"
 #include "nxrt/memory.h"
+#include "nxrt/rtl_text.h"
 #include "nxrt/services_api.h"
 #include "services_internal.h"
 
@@ -709,7 +710,9 @@ struct AppletState {
     bool utf8 = false;                                     // software keyboard: the config's use_utf8
     bool text_check = false;                               // software keyboard: the config's use_text_check
     std::u16string text;                                   // software keyboard: the text answered
+    std::u16string edit_text;                              // software keyboard: reading-order text before swkbd_display_order, for retries
     swkbdui::Request req;                                  // software keyboard: what the prompt shows
+    bool display_order = false;                            // software keyboard: answer right-to-left text in display order
 };
 
 // Ends the applet: it has exited and its state-changed event fires. The caller holds mu().
@@ -752,6 +755,8 @@ void swkbd_answer(AppletState& a, bool ok) {
         swkbd_submit(a, kSwkbdResultCancel);
         return;
     }
+    a.edit_text = a.text;
+    if (a.display_order) a.text = utf8_to_utf16(rtl::to_display_utf8(utf16_to_utf8(a.text)));
     NXLOG_I("am", "swkbd: answering \"%s\"%s", utf16_to_utf8(a.text).c_str(), a.text_check ? " (to the game's text check first)" : "");
     if (!a.text_check) {
         swkbd_submit(a, kSwkbdResultOk);
@@ -765,6 +770,17 @@ void swkbd_answer(AppletState& a, bool ok) {
     put_text(out->data() + 8, kSwkbdStringSize, a.text, a.utf8);
     a.interactive_out.push_back(out);
     a.interactive_out_event.signal();
+}
+
+// [applet] swkbd_display_order: whether the typed text goes back to the game in display order (right-to-left letters joined and laid
+// out left to right, as the game draws them). Fan translations of console games store their Arabic or Hebrew that way because the
+// game has no shaping of its own; a game that does so shows it in the keyboard's header or initial text. auto (default): when one of
+// them is in display order; true / false: always / never.
+bool swkbd_display_order(const swkbdui::Request& r) {
+    const std::string mode = nxrt::config_get_str("applet", "swkbd_display_order", "auto");
+    if (mode == "auto")
+        return rtl::is_display_order(rtl::utf8_to_u32(r.initial)) || rtl::is_display_order(rtl::utf8_to_u32(r.header));
+    return nxrt::config_get_bool("applet", "swkbd_display_order", false);
 }
 
 // Asks the on-screen keyboard on its own thread; the answer arrives with mu() taken there.
@@ -814,6 +830,8 @@ void swkbd_start(const std::shared_ptr<AppletState>& ap) {
         NXLOG_W("am", "swkbd: no keyboard config among the %zu storages pushed: defaults used", a.in_data.size());
     }
     r.max_len = max_len;
+    a.display_order = swkbd_display_order(r);
+    if (a.display_order && rtl::is_display_order(rtl::utf8_to_u32(r.initial))) r.initial = rtl::u32_to_utf8(rtl::from_display(rtl::utf8_to_u32(r.initial)));
     NXLOG_I("am", "swkbd: version 0x%x, config %zu bytes, work %zu bytes, max length %u, utf8 %d, text check %d, header \"%s\", guide \"%s\", initial \"%s\"",
             version, cfg ? cfg->size() : size_t{0}, work ? work->size() : size_t{0}, max_len, a.utf8 ? 1 : 0, a.text_check ? 1 : 0,
             r.header.c_str(), r.guide.c_str(), r.initial.c_str());
@@ -848,7 +866,7 @@ void swkbd_interactive(const std::shared_ptr<AppletState>& ap) {
     NXLOG_W("am", "swkbd: the game rejected the text (text check result %u: \"%s\")", check, why.c_str());
     if (prompt_flag().load() && !nxrt::config_has("applet", "swkbd_text")) {
         if (!why.empty()) a.req.guide = why;
-        a.req.initial = utf16_to_utf8(a.text);
+        a.req.initial = utf16_to_utf8(a.edit_text);
         swkbd_prompt_async(ap);
     } else {
         swkbd_submit(a, kSwkbdResultCancel);

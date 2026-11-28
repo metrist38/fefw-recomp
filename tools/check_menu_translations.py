@@ -148,6 +148,34 @@ def translation_problem(key, value):
     return None
 
 
+# Right-to-left tables (menu_language_is_rtl in menu_i18n.h): the runtime lays each line out right to left, so two conversions with
+# a right-to-left word between them would trade places (menu_rtl_problem in menu_i18n.cpp).
+RTL_LANGUAGES = {"ar", "fa", "ur", "he", "iw"}
+RTL_LETTER = re.compile("[֐-׿؀-ٟٮ-ۯۺ-ࣿיִ-﷿ﹰ-ﻼ]")
+
+
+def is_rtl_table(path):
+    return re.split(r"[-_]", path.stem)[0].lower() in RTL_LANGUAGES
+
+
+def rtl_problem(value):
+    """Why a right-to-left table's line would be dropped, or None."""
+    spans, i = [], 0
+    while (i := value.find("%", i)) >= 0:
+        if value.startswith("%%", i):
+            i += 2
+            continue
+        match = PLAIN.match(value, i + 1)
+        if not match:
+            i += 1
+            continue
+        spans.append((i, match.end()))
+        i = match.end()
+    if len(spans) >= 2 and RTL_LETTER.search(value, spans[0][1], spans[-1][0]):
+        return "right-to-left words between two format specifiers would swap their arguments"
+    return None
+
+
 def read_table(path):
     """The keys the menu would translate, and (line, key, problem) of each line it would drop."""
     keys, dropped = set(), []
@@ -158,7 +186,7 @@ def read_table(path):
         key, _, value = (part.strip(TRIM) for part in line.partition("\t" if "\t" in line else "="))
         if not key or not value:
             continue
-        problem = translation_problem(key, value)
+        problem = translation_problem(key, value) or (rtl_problem(value) if is_rtl_table(path) else None)
         if problem:
             dropped.append((number, key, problem))
         else:

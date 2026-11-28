@@ -86,7 +86,7 @@ The project has two independent language systems; they do not share files:
 | File | `locales/<code>.ini` (next to `fefw_rt.dll`) | `locales/<code>.json` (next to `fefw-launcher.exe`) |
 | Format | `English string = translation` lines | JSON object with `code`, `name`, `strings` |
 | Selected by | `[gfx] ui_language` in `fefw.ini` (`auto`: the system language) | `lang` in `launcher.json` (empty: the system language) |
-| Shipped here | `zh.ini` | `template.json` (an empty starting point) |
+| Shipped here | `zh.ini`, `ar.ini` | `template.json` (an empty starting point), `ar.json` (in `launcher/locales/`) |
 
 `zh.ini` and the launcher's JSON packs are separate features: this folder holds
 the in-game table, and the launcher's packs live in its own install folder. A
@@ -105,6 +105,21 @@ loads the first font it finds from:
 
 Without one of these the menu renders boxes for CJK characters; English
 tables need no font setup.
+
+Arabic and Hebrew need none either: the runtime merges in the first of Segoe UI, Tahoma or Arial from
+`C:\Windows\Fonts` for the glyphs the menu font lacks.
+
+## Right-to-left tables
+
+A table named for Arabic, Persian, Urdu or Hebrew (`ar.ini`, `fa.ini`, `ur.ini`, `he.ini`) is written in
+reading order, like any other. At load the runtime joins the letters and lays each line out right to left
+(`runtime/include/nxrt/rtl_text.h`), because ImGui draws left to right and knows no Arabic letter forms;
+wrapped help text is broken into lines from its reading start and set against the right edge.
+
+Each printf conversion stays one left-to-right unit, but two conversions with a right-to-left word between
+them would trade places, so the menu drops such a line (and `tools/check_menu_translations.py` fails on it).
+Keep the values of a line together, with the words before or after them: `الإطارات: %d / %d`, not
+`%d من %d`.
 
 ## Ship checklist for a new language
 

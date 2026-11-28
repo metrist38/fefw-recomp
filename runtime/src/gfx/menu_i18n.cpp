@@ -18,6 +18,7 @@
 
 #include "nxrt/config.h"
 #include "nxrt/log.h"
+#include "nxrt/rtl_text.h"
 
 namespace nxrt::gfx {
 namespace {
@@ -126,10 +127,33 @@ const char* menu_translation_problem(const std::string& key, const std::string& 
     return nullptr;
 }
 
+// In a right-to-left table: two or more conversions with a right-to-left letter between the first and the last. Laid out right to
+// left, such a line would hand printf its arguments in the wrong order.
+const char* menu_rtl_problem(const std::string& value) {
+    const std::u32string u = rtl::utf8_to_u32(value);
+    size_t first = std::u32string::npos, last = 0, count = 0;
+    for (size_t i = 0; i + 1 < u.size(); ++i) {
+        if (u[i] != '%') continue;
+        if (u[i + 1] == '%') {
+            ++i;
+            continue;
+        }
+        const std::string one = conversions(rtl::u32_to_utf8(u.substr(i, 8)));
+        if (one.empty()) continue;
+        if (first == std::u32string::npos) first = i;
+        last = i;
+        ++count;
+    }
+    if (count < 2) return nullptr;
+    for (size_t i = first; i < last; ++i)
+        if (rtl::is_rtl(u[i])) return "right-to-left words between two format specifiers would swap their arguments";
+    return nullptr;
+}
+
 namespace {
 
 // "key = value" lines; the value keeps inner spaces, the key is trimmed. UTF-8 in, UTF-8 out (ImGui is UTF-8 aware).
-void load_file(const std::string& path) {
+void load_file(const std::string& path, bool rtl) {
     std::ifstream f(path.c_str(), std::ios::binary);
     if (!f) return;
     std::string line;
@@ -158,6 +182,26 @@ void load_file(const std::string& path) {
             ++dropped;
             NXLOG_W(kTag, "dropping the translation of \"%s\": %s", key.c_str(), problem);
             continue;
+        }
+        if (rtl) {
+            // ImGui draws left to right: the line is stored in display order, each printf conversion kept as one unit. Two conversions
+            // with right-to-left words between them would swap places, so such a line is dropped (the CI check has the same rule).
+            if (const char* problem = menu_rtl_problem(value)) {
+                ++dropped;
+                NXLOG_W(kTag, "dropping the translation of \"%s\": %s", key.c_str(), problem);
+                continue;
+            }
+            rtl::Options o;
+            o.printf_tokens = true;
+            // an ImGui ID after "##" ("Clear##render") is not shown: only the label before it is laid out, the ID stays as it is
+            const size_t id = value.find("##");
+            value = id == std::string::npos ? rtl::to_display_utf8(value, o)
+                                            : rtl::to_display_utf8(value.substr(0, id), o) + value.substr(id);
+            if (conversions(value) != conversions(key)) {   // a guard: the layout must never reorder the arguments
+                ++dropped;
+                NXLOG_W(kTag, "dropping the translation of \"%s\": its conversions change order in display order", key.c_str());
+                continue;
+            }
         }
         table()[key] = value;
         ++n;
@@ -194,7 +238,7 @@ void menu_i18n_init() {
     if (lang.empty()) return;
     const std::string dir = exe_dir();
     if (dir.empty()) return;
-    load_file(dir + "\\locales\\" + lang + ".ini");
+    load_file(dir + "\\locales\\" + lang + ".ini", menu_language_is_rtl(lang));
 }
 
 const char* tr(const char* s) {

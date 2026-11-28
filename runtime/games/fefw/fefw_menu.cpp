@@ -567,7 +567,7 @@ void output_size(const std::string& v, bool wide, int* w, int* h) {
 
 void resolution_group(Menu& m) {
     section("Resolution");
-    ImGui::TextWrapped("%s", tr("The game chooses its render configuration once, at start: these apply on restart (notes/resolution.md)."));
+    nxrt::gfx::text_wrapped("%s", tr("The game chooses its render configuration once, at start: these apply on restart (notes/resolution.md)."));
     if (begin_rows("res")) {
         // the output: the entries, or a WxH from the ini shown as it is
         const IniKey& out = *ini_key("fefw", "output");
@@ -862,7 +862,7 @@ void live_status_group() {
         else
             ImGui::Text(tr("Upscaler: %s (%s)"), tr(render_status::backend_name(s.actual)),
                         s.configured == render_status::Backend::Auto ? tr("chosen by Auto") : tr("as configured"));
-        if (s.fallback && s.reason[0]) ImGui::TextWrapped("%s", s.reason);
+        if (s.fallback && s.reason[0]) nxrt::gfx::text_wrapped("%s", s.reason);
         // The pass's own extents: the input it upscaled and the output it wrote.
         if (s.output_w > 0)
             ImGui::Text(tr("Render %d x %d -> %d x %d (%d%%, %s)"), s.render_w, s.render_h, s.output_w, s.output_h, s.percent,
@@ -874,7 +874,7 @@ void live_status_group() {
     const char* backend = s.fg_dlss ? "DLSS Frame Generation" : s.fg_ffx ? tr("FSR 3 frame generation") : tr("none");
     ImGui::Text(tr("Frame generation: %s (%s)"), tr(render_status::framegen_name(s.fg)), backend);
     if (s.fg == render_status::FrameGen::Paused && s.pause != render_status::Pause::None)
-        ImGui::TextWrapped(tr("Why it is paused: %s"), tr(render_status::pause_name(s.pause)));
+        nxrt::gfx::text_wrapped(tr("Why it is paused: %s"), tr(render_status::pause_name(s.pause)));
     if (s.measured && s.game_frames > 0) {
         // Three separate numbers, because the backend's own count covers every present: the game's frames, what reached the display, and
         // the extra frames the difference proves.
@@ -924,7 +924,7 @@ constexpr const char* kNpcVals[] = {"1", "1.5", "2", "3", "4"};
 
 void detail_group(Menu& m) {
     section("Graphics detail");
-    ImGui::TextWrapped(tr("The game's own graphics settings and limits, changed as the game loads them: these apply on restart."));
+    nxrt::gfx::text_wrapped(tr("The game's own graphics settings and limits, changed as the game loads them: these apply on restart."));
     if (!begin_rows("detail")) return;
     ini_combo_row(m, *ini_key("fefw", "reflections"), "Reflections",
                   "Screen-space reflections on floors and water. Reduced takes 8 rays instead of 32 and mostly helps in the hubs.",
@@ -969,7 +969,7 @@ void fps_name(int v, char* buf, size_t n) {
 void framerate_page(UiHost& host, Menu& m, const play::LiveStatus& live, gfx::Overlay& ov) {
     const ClockInfo ck = clock_info();
     section("The game's frame rate");
-    ImGui::TextWrapped("%s", tr("The game steps its world by its own frame rate; the hooks that change it are installed at start."));
+    nxrt::gfx::text_wrapped("%s", tr("The game steps its world by its own frame rate; the hooks that change it are installed at start."));
     if (begin_rows("game")) {
         const IniKey& k60 = *ini_key("fefw", "fps60");
         const IniKey& k120 = *ini_key("fefw", "fps120");
@@ -1144,7 +1144,7 @@ constexpr KeyRowName kKeyRows[] = {
 
 void keyboard_section(Menu& m) {
     section("Keyboard");
-    ImGui::TextWrapped("%s", tr("The keys each Switch button or stick has. To change them, close the game and edit [bindings.all] in controls.ini."));
+    nxrt::gfx::text_wrapped("%s", tr("The keys each Switch button or stick has. To change them, close the game and edit [bindings.all] in controls.ini."));
     if (!begin_rows("keys")) return;
     std::vector<std::pair<std::string, std::string>> rows;   // label, keys
     auto add = [&](const std::string& label, const std::string& key) {
@@ -1184,7 +1184,7 @@ void keyboard_section(Menu& m) {
 // set what the PC mouse sends it.
 void mouse_section(UiHost& host, Menu& m) {
     section("Mouse");
-    ImGui::TextWrapped("%s", tr("The mouse works as the game's Joy-Con 2 mouse: move it and the game switches to its mouse controls (camera in "
+    nxrt::gfx::text_wrapped("%s", tr("The mouse works as the game's Joy-Con 2 mouse: move it and the game switches to its mouse controls (camera in "
                                 "bases and dungeons, map cursor in battle, selection in menus); press a key or use the controller and it switches back. "
                                 "The game's own speeds are the (Mouse) rows of its System > Settings; System > Mouse Controls lists every button."));
     play::MouseSettings& ms = m.edit.mouse;
@@ -1262,13 +1262,13 @@ void haptic_group(UiHost& host, Menu& m) {
         end_rows();
     }
     if (st.backend == haptic::Backend::DualSenseUsb)
-        ImGui::TextWrapped("%s", tr("Weak vibration over USB? Raise the controller's volume in your system sound settings."));
+        nxrt::gfx::text_wrapped("%s", tr("Weak vibration over USB? Raise the controller's volume in your system sound settings."));
     if (!st.dll) ImGui::TextDisabled("%s", tr("renhdrum.dll is not next to the game: the standard rumble only."));
     if (st.device[0] == 0) {
         ImGui::TextDisabled("%s", tr("No pad for the haptics yet."));
     } else {
         ImGui::TextDisabled(tr("%s: %s, %s"), st.device, tr(haptic::backend_name(st.backend)), tr(st.wired ? "on a cable" : "wireless"));
-        if (st.detail[0]) ImGui::TextWrapped("%s", tr(st.detail));
+        if (st.detail[0]) nxrt::gfx::text_wrapped("%s", tr(st.detail));
         ImGui::TextDisabled(tr("Live: %s; %llu values from the game, %llu packets sent."), st.running ? tr("yes") : tr("no"),
                             static_cast<unsigned long long>(st.pushes), static_cast<unsigned long long>(st.packets));
     }
@@ -1312,7 +1312,7 @@ void controls_page(UiHost& host, Menu& m, const play::LiveStatus& live) {
     mouse_section(host, m);
 
     section("Button mapping");
-    ImGui::TextWrapped("%s", tr("What each controller button presses on the Switch pad. Default keeps the layout above."));
+    nxrt::gfx::text_wrapped("%s", tr("What each controller button presses on the Switch pad. Default keeps the layout above."));
     if (begin_rows("map")) {
         for (int i = 0; i < play::kPadSrcCount; ++i) {
             uint64_t& v = p.remap[i];
@@ -1770,8 +1770,8 @@ void settings_menu(play::UiHost& host, gfx::Overlay& ov) {
         // bottom: the row's description, the notice or what waits for a restart, Close
         ImGui::Separator();
         ImGui::PushTextWrapPos(0.f);
-        if (!m.help.empty()) ImGui::TextUnformatted(tr(m.help.c_str()));
-        else ImGui::TextDisabled("%s", tr("Changes apply at once and are saved. Rows marked restart apply when the game starts again."));
+        if (!m.help.empty()) nxrt::gfx::text_wrapped("%s", tr(m.help.c_str()));
+        else nxrt::gfx::text_wrapped_disabled("%s", tr("Changes apply at once and are saved. Rows marked restart apply when the game starts again."));
         ImGui::PopTextWrapPos();
         ImGui::SetCursorPosY(ImGui::GetWindowHeight() - ImGui::GetStyle().WindowPadding.y - ImGui::GetFrameHeight());
         const std::string waits = pending_list(m);

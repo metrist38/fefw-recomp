@@ -46,6 +46,9 @@ export function t(key, vars) {
 /** True when the active language needs a wider font stack (Chinese, Japanese, Korean). */
 const wide = (code) => /^(zh|ja|ko)/i.test(code);
 
+/** True for a right-to-left language (Arabic, Persian, Urdu, Hebrew): the page is laid out from the right. */
+const rtl = (code) => /^(ar|fa|ur|he|iw)(\b|[-_])/i.test(code);
+
 /**
  * Switches the interface language and redraws what is on screen. `redraw` is
  * called after the table is loaded, so the caller decides what to repaint
@@ -70,6 +73,7 @@ export async function setLang(code, redraw) {
   }
   document.documentElement.lang = current === 'zh' ? 'zh-CN' : current;
   document.documentElement.classList.toggle('cjk', wide(current));
+  document.documentElement.dir = rtl(current) ? 'rtl' : 'ltr';
   if (typeof redraw === 'function') redraw();
 }
 

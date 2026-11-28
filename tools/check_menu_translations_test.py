@@ -16,6 +16,24 @@ def accepted(key: str, value: str) -> bool:
     return c.translation_problem(key, value) is None
 
 
+class RightToLeftTest(unittest.TestCase):
+    """menu_rtl_problem in menu_i18n.cpp: in an Arabic table, conversions stay in one left-to-right run."""
+
+    def test_conversions_kept_together_are_accepted(self):
+        self.assertIsNone(c.rtl_problem("الإطارات: %d / %d"))
+        self.assertIsNone(c.rtl_problem("تم حفظ %s بنجاح"))
+        self.assertIsNone(c.rtl_problem("القيمة %d%%"))
+
+    def test_words_between_conversions_are_refused(self):
+        self.assertIsNotNone(c.rtl_problem("%d من %d"))
+        self.assertIsNotNone(c.rtl_problem("%s (ضبطه %s)"))
+
+    def test_only_arabic_tables_get_the_rule(self):
+        self.assertTrue(c.is_rtl_table(Path("locales/ar.ini")))
+        self.assertTrue(c.is_rtl_table(Path("locales/fa-IR.ini")))
+        self.assertFalse(c.is_rtl_table(Path("locales/zh.ini")))
+
+
 class SpecifierTest(unittest.TestCase):
     """The cases of runtime/tests/gfx/test_menu_translation.cpp, and the rules of locales/README.md."""
 
