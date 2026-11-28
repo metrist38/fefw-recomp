@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "nxrt/config.h"
+#include "nxrt/frame_limiter.h"
 #include "nxrt/ftrace.h"
 #include "nxrt/gfx_tuning.h"
 #include "nxrt/gauge.h"
@@ -88,6 +89,8 @@ struct TexGpu {
     VkExtent3D base = {1, 1, 1};                        // level 0 extent (depth for 3D images)
     uint32_t levels = 1, layers = 1;
     VkImageUsageFlags usage = 0;
+    VkImageCreateFlags create_flags = 0;                // flags the image was created with (so rescale/demote keep EXTENDED_USAGE)
+    bool create_known = false;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;   // tracked layout (the same for every level and layer)
     bool failed = false;                                // no image: the texture is not usable on the GPU (logged once)
@@ -918,8 +921,11 @@ TexGpu* create_texture_gpu(Texture* t, float want_scale) {
         // sRGB formats have no storage support. The console's image stores write the raw bits (no sRGB encode), which is what a UNORM view
         // of the same image does: storage usage is then allowed through EXTENDED_USAGE when the UNORM partner can be stored to.
         const VkFormat unorm = is_srgb(chosen) ? srgb_partner(chosen) : VK_FORMAT_UNDEFINED;
+        // The image itself (the sRGB format with storage usage and EXTENDED_USAGE) must pass too: Intel 7th-10th gen drivers accept
+        // the UNORM partner with storage but refuse this combination (-11), dropping every sRGB render target.
         if (!(usage & VK_IMAGE_USAGE_STORAGE_BIT) && unorm != VK_FORMAT_UNDEFINED && (flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
-            device().image_supported(make_desc(s, unorm, usage | VK_IMAGE_USAGE_STORAGE_BIT, flags))) {
+            device().image_supported(make_desc(s, unorm, usage | VK_IMAGE_USAGE_STORAGE_BIT, flags)) &&
+            device().image_supported(make_desc(s, chosen, usage | VK_IMAGE_USAGE_STORAGE_BIT, flags | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT))) {
             flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
             usage |= VK_IMAGE_USAGE_STORAGE_BIT;
         }
@@ -942,6 +948,8 @@ TexGpu* create_texture_gpu(Texture* t, float want_scale) {
         }
     }
     g->usage = usage;
+    g->create_flags = flags;
+    g->create_known = true;
 
     // Resolution scale: the image is the NVN size times the scale. Other modules keep the NVN size (tex_extent) and ask tex_scale /
     // tex_image_extent where the image size matters (render area, viewports, copies, the support buffer's render_scale).
@@ -1845,6 +1853,12 @@ float tex_scale_wanted(Texture* t) {
     return attachment_scale(*t);
 }
 
+// The create flags for an image made again (tex_rescale, tex_demote): the flags it was made with, so an sRGB image with storage usage
+// keeps VK_IMAGE_CREATE_EXTENDED_USAGE_BIT; base_flags for images whose flags were not recorded (sparse).
+static VkImageCreateFlags remake_flags(const TexGpu& g, const Shape& s) {
+    return g.create_known ? g.create_flags : base_flags(s, g.format);
+}
+
 // Remakes the image at another scale (Ryujinx scales a texture when it becomes a render target and blacklists one that cannot be
 // scaled). The content is blitted over when the format allows it (otherwise it starts undefined). Going to 1 is for good. The old image
 // and its views are destroyed after the frames that use them.
@@ -1859,7 +1873,7 @@ bool tex_rescale(Texture* t, Frame& f, float to, const char* why) {
     }
     gfx::Image ni;
     std::string err;
-    if (device().create_image(make_desc(s, g->format, g->usage, base_flags(s, g->format)), &ni, &err) != VK_SUCCESS) {
+    if (device().create_image(make_desc(s, g->format, g->usage, remake_flags(*g, s)), &ni, &err) != VK_SUCCESS) {
         NXLOG_W(kTag, "texture %u: cannot remake it at %ux%u (%s): it keeps scale %.3f", t->id, s.base.width, s.base.height, err.c_str(), g->scale);
         if (to == 1.0f) g->scale_blocked = true;
         return false;
@@ -1989,6 +2003,8 @@ bool tex_f16_promote(Texture* t, Frame& f) {
     g->image_id = next_image_id();
     g->layout = nl;
     g->format = hf;
+    g->create_flags = base_flags(s, hf);
+    g->create_known = true;
     g->promoted = true;
     g->mutable_fmt = srgb_partner(hf) != VK_FORMAT_UNDEFINED || bit_alias_class(hf);
     g->est_bytes *= 2;
@@ -2137,7 +2153,7 @@ uint64_t tex_demote(Texture* t, TexGpu* g, Frame& f) {
     ns.layers = g->layers;
     gfx::Image ni;
     std::string err;
-    gfx::ImageDesc nd = make_desc(ns, g->format, g->usage, base_flags(s, g->format));
+    gfx::ImageDesc nd = make_desc(ns, g->format, g->usage, remake_flags(*g, s));
     nd.small_pool = true;   // not in the room the whole images leave: their blocks can empty and go back to the OS
     if (device().create_image(nd, &ni, &err) != VK_SUCCESS) return 0;
     move_layout(f, *g, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -2638,7 +2654,8 @@ bool tex_remake_from_bc5(Texture* t, TexGpu* g) {
         add(VK_IMAGE_USAGE_STORAGE_BIT);
         const VkFormat unorm = is_srgb(chosen) ? srgb_partner(chosen) : VK_FORMAT_UNDEFINED;
         if (!(usage & VK_IMAGE_USAGE_STORAGE_BIT) && unorm != VK_FORMAT_UNDEFINED && (flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
-            device().image_supported(make_desc(is, unorm, usage | VK_IMAGE_USAGE_STORAGE_BIT, flags))) {
+            device().image_supported(make_desc(is, unorm, usage | VK_IMAGE_USAGE_STORAGE_BIT, flags)) &&
+            device().image_supported(make_desc(is, chosen, usage | VK_IMAGE_USAGE_STORAGE_BIT, flags | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT))) {   // as above
             flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
             usage |= VK_IMAGE_USAGE_STORAGE_BIT;
         }
@@ -2670,6 +2687,8 @@ bool tex_remake_from_bc5(Texture* t, TexGpu* g) {
     g->image_id = next_image_id();
     g->format = chosen;
     g->usage = usage;
+    g->create_flags = flags;
+    g->create_known = true;
     g->mutable_fmt = srgb_partner(chosen) != VK_FORMAT_UNDEFINED || bit_alias_class(chosen);
     g->layout = VK_IMAGE_LAYOUT_UNDEFINED;
     g->uploaded = false;
@@ -3085,6 +3104,52 @@ bool tex_first_upload_deferrable(Texture* t) {
         return lazy && active() && !t->destroyed.load(std::memory_order_relaxed) && t->fmt->aspect == kAspectColor && t->b.samples <= 1 && !texture_registry_find_alias(t);
     }
     return !g->failed && !g->uploaded && !g->gpu_written && !g->depth && !g->promoted && g->scale == 1.0f;
+}
+
+bool tex_early_upload_ok(Texture* t) {
+    if (!tex_first_upload_deferrable(t) || !t->mem || t->vpool) return false;
+    const TexGpu* g = t->gpu;
+    return !g || (!g->sparse && g->layout == VK_IMAGE_LAYOUT_UNDEFINED);
+}
+
+// [nvn] load_uploads_ms (default 16; 0 = off): while a loading screen shows (the frame limiter's loading state), the first uploads of
+// registered asset textures whose background preparation is done go in, up to this much render-thread time a present, at the start of
+// the submission (no pass is open there). The load-in frame and the ones after it then find most of the area's textures ready instead
+// of uploading them between their draws. Only textures nothing has used yet (tex_early_upload_ok) and whose prepared result waits
+// (texprep::has_result): no CPU transcode or untile here.
+namespace {
+std::atomic<uint64_t> g_load_uploads{0};
+const bool g_load_uploads_hitch = (nxrt::hitch_add_counter("load_uploads", []() -> uint64_t { return g_load_uploads.load(std::memory_order_relaxed); }), true);
+}  // namespace
+
+void tex_load_uploads(Frame& f) {
+    static const int64_t budget_ms = std::clamp<int64_t>(nxrt::config_get_int("nvn", "load_uploads_ms", 16), 0, 1000);
+    if (budget_ms <= 0 || !nxrt::frame_limiter_loading()) return;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(budget_ms);
+    std::unordered_set<const Texture*> reg;
+    pool_registered_textures(reg);
+    uint64_t n = 0;
+    uint32_t scanned = 0;
+    for (const Texture* ct : reg) {
+        if ((++scanned & 255) == 0 && std::chrono::steady_clock::now() >= until) break;
+        Texture* t = const_cast<Texture*>(ct);
+        if (!tex_early_upload_ok(t) || !texprep::has_result(t)) continue;
+        if (std::chrono::steady_clock::now() >= until) break;
+        tex_ensure_current(t, f);
+        tex_transition(t, f, tex_sampled_layout(t));
+        ++n;
+    }
+    if (!n) return;
+    static uint64_t total = 0;
+    static uint32_t logged_at = 0;
+    total += n;
+    g_load_uploads.fetch_add(n, std::memory_order_relaxed);
+    const uint32_t now = static_cast<uint32_t>(counters().presents.load(std::memory_order_relaxed));
+    if (now - logged_at >= 300) {
+        logged_at = now;
+        NXLOG_I(kTag, "loading screens: %llu textures uploaded ahead so far (%zu registered now; [nvn] load_uploads_ms)", static_cast<unsigned long long>(total),
+                reg.size());
+    }
 }
 
 bool tex_first_upload_uncompressed_deferrable(Texture* t) {
