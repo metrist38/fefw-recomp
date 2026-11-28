@@ -262,32 +262,39 @@ export default definePlugin(() => {
   const timer = setInterval(() => void follow(), 2000);
   void bootstrapStore();
 
-  // Signal runtime pause when Steam Game Mode UI (Steam menu, QAM, keyboard) takes focus or the device suspends.
+  // Signal runtime pause when Steam Game Mode UI (Steam menu, QAM, keyboard) takes focus or the device suspends,
+  // but only while at least one game session is running (so no stale flag is left behind for Desktop Mode launches).
+  const runningApps = new Set<number>();
   let lastFocusedAppId = 0;
+  let suspended = false;
   let lastPausedSent = false;
-  const pushPaused = (paused: boolean) => {
-    if (paused === lastPausedSent) return;
-    lastPausedSent = paused;
-    void setGamePaused(paused);
+  const syncPaused = () => {
+    const want = runningApps.size > 0 && (suspended || lastFocusedAppId === STEAM_UI_APPID);
+    if (want === lastPausedSent) return;
+    lastPausedSent = want;
+    void setGamePaused(want);
   };
   const focusSub =
     typeof SteamClient !== "undefined"
       ? SteamClient.System?.UI?.RegisterForFocusChangeEvents?.((e) => {
           const appid = e?.focusedApp?.appid ?? 0;
           lastFocusedAppId = appid;
-          pushPaused(appid === STEAM_UI_APPID);
+          if (appid !== 0 && appid !== STEAM_UI_APPID) runningApps.add(appid);
+          syncPaused();
         })
       : undefined;
   const suspendSub =
     typeof SteamClient !== "undefined"
       ? SteamClient.System?.RegisterForOnSuspendRequest?.(() => {
-          pushPaused(true);
+          suspended = true;
+          syncPaused();
         })
       : undefined;
   const resumeSub =
     typeof SteamClient !== "undefined"
       ? SteamClient.System?.RegisterForOnResumeFromSuspend?.(() => {
-          pushPaused(lastFocusedAppId === STEAM_UI_APPID);
+          suspended = false;
+          syncPaused();
         })
       : undefined;
 
@@ -295,7 +302,9 @@ export default definePlugin(() => {
   const lifetimeSub =
     typeof SteamClient !== "undefined"
       ? SteamClient.GameSessions?.RegisterForAppLifetimeNotifications?.((n) => {
-          if (!n.bRunning) pushPaused(false);
+          if (n.bRunning) runningApps.add(n.unAppID);
+          else runningApps.delete(n.unAppID);
+          syncPaused();
           // only this game's end matters, and the status saw it running; polling is held back while it runs
           if (!n.bRunning && isGameRunning()) void rereadState();
         })

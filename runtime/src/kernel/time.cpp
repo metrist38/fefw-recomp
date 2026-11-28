@@ -14,6 +14,7 @@ std::atomic<bool> g_paused{false};
 std::atomic<uint32_t> g_pause_owner_tid{0};
 std::atomic<uint64_t> g_paused_qpc_total{0};
 std::atomic<uint64_t> g_pause_start_qpc{0};
+std::atomic<uint64_t> g_pause_seq{0};   // even = running, odd = paused (seqlock for consistent system_tick() reads)
 SRWLOCK g_pause_lock = SRWLOCK_INIT;
 CONDITION_VARIABLE g_pause_cv = CONDITION_VARIABLE_INIT;
 
@@ -31,6 +32,7 @@ void set_paused(bool paused, uint32_t owner_tid) {
         g_pause_start_qpc.store(raw_qpc(), std::memory_order_relaxed);
         g_pause_owner_tid.store(owner_tid, std::memory_order_relaxed);
         g_paused.store(true, std::memory_order_release);
+        g_pause_seq.fetch_add(1, std::memory_order_release);   // now odd (paused)
     } else if (!paused && was) {
         const uint64_t now = raw_qpc();
         const uint64_t start = g_pause_start_qpc.load(std::memory_order_relaxed);
@@ -39,6 +41,7 @@ void set_paused(bool paused, uint32_t owner_tid) {
         }
         g_pause_owner_tid.store(0, std::memory_order_relaxed);
         g_paused.store(false, std::memory_order_release);
+        g_pause_seq.fetch_add(1, std::memory_order_release);   // now even (running, offset updated)
         WakeAllConditionVariable(&g_pause_cv);
     }
     ReleaseSRWLockExclusive(&g_pause_lock);
@@ -70,16 +73,22 @@ uint64_t system_tick() {
         return static_cast<uint64_t>(f.QuadPart);
     }();
     uint64_t v = 0;
-    if (!g_paused.load(std::memory_order_acquire)) {
+    for (;;) {
+        const uint64_t s1 = g_pause_seq.load(std::memory_order_acquire);
+        if (s1 & 1u) {
+            AcquireSRWLockShared(&g_pause_lock);
+            const uint64_t q = g_paused.load(std::memory_order_relaxed) ? g_pause_start_qpc.load(std::memory_order_relaxed) : raw_qpc();
+            const uint64_t off = g_paused_qpc_total.load(std::memory_order_relaxed);
+            v = q > off ? q - off : 0;
+            ReleaseSRWLockShared(&g_pause_lock);
+            break;
+        }
+        const uint64_t off = g_paused_qpc_total.load(std::memory_order_relaxed);
         const uint64_t q = raw_qpc();
-        const uint64_t off = g_paused_qpc_total.load(std::memory_order_relaxed);
-        v = q > off ? q - off : 0;
-    } else {
-        AcquireSRWLockShared(&g_pause_lock);
-        const uint64_t q = g_paused.load(std::memory_order_relaxed) ? g_pause_start_qpc.load(std::memory_order_relaxed) : raw_qpc();
-        const uint64_t off = g_paused_qpc_total.load(std::memory_order_relaxed);
-        v = q > off ? q - off : 0;
-        ReleaseSRWLockShared(&g_pause_lock);
+        if (g_pause_seq.load(std::memory_order_acquire) == s1) {
+            v = q > off ? q - off : 0;
+            break;
+        }
     }
     const uint64_t hz = tick_hz();
     return (v / freq) * hz + (v % freq) * hz / freq;     // split so the multiplication cannot overflow

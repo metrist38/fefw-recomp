@@ -929,25 +929,25 @@ int update_hook(::Ctx*, uint64_t, void*) {
         const char* env = std::getenv("NXRT_PAUSE_FILE");
         return (env && *env) ? std::string(env) : std::string("Z:\\tmp\\fefw-recomp-pause");
     }();
-    auto external_pause_active = [&](bool force) {
+    auto external_pause_active = [&]() {
         static uint64_t last_check_ms = 0;
         static bool cached = false;
         const uint64_t t_ms = SDL_GetTicks();
-        if (force || t_ms - last_check_ms >= 40) {
+        if (t_ms - last_check_ms >= 40) {
             last_check_ms = t_ms;
             cached = GetFileAttributesA(ext_pause_path.c_str()) != INVALID_FILE_ATTRIBUTES;
         }
         return cached;
     };
-    auto should_pause = [&](bool force_ext) {
+    auto should_pause = [&]() {
         const bool ov = st.overlay && st.overlay->blocks_game();
         const bool unfoc = st.window && !platform::focused();
-        const bool ext = st.window && st.settings.fastboot.pause_unfocused && external_pause_active(force_ext);
+        const bool ext = st.window && st.settings.fastboot.pause_unfocused && external_pause_active();
         return (ov && st.settings.fastboot.pause_in_menu) || (unfoc && st.settings.fastboot.pause_unfocused) || ext;
     };
-    if (should_pause(false)) {
+    if (should_pause()) {
         const bool unfoc_start = st.window && !platform::focused();
-        const bool ext_start = st.window && st.settings.fastboot.pause_unfocused && external_pause_active(false);
+        const bool ext_start = st.window && st.settings.fastboot.pause_unfocused && external_pause_active();
         NXLOG_I(kTag, "pause: entering runtime pause (%s)",
                 overlay_visible ? "F1 menu open" : (ext_start ? "Steam menu / external" : (unfoc_start ? "window unfocused" : "other")));
         st.engine->release_all(now);
@@ -959,7 +959,7 @@ int update_hook(::Ctx*, uint64_t, void*) {
             platform::set_cursor_visible(true);
         }
         uint64_t last_present_ms = 0;
-        while (should_pause(true)) {
+        while (should_pause()) {
             const uint64_t pnow = now_ns();
             if (st.window && on_pump_thread) {
                 platform::pump_events();
@@ -1574,6 +1574,8 @@ bool start(const StartOptions& opt) {
 void stop() {
     G& st = g();
     if (!st.started) return;
+    audio::set_paused(false);
+    kernel::set_paused(false);
     vpad_shutdown();      // a virtual pad from a test script does not outlive play mode
     if (const GamePlay* gp = game_play(); gp && gp->remove) gp->remove();
     kernel::set_blocked_hook(0, nullptr);

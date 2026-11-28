@@ -261,7 +261,7 @@ bool XAudio2Sink::open(uint32_t sample_rate, uint32_t channels) {
         teardown();
         return false;
     }
-    if (!paused_.load(std::memory_order_acquire)) {
+    if (!(paused_.load(std::memory_order_acquire) || audio::paused())) {
         hr = source_->Start(0);
         if (FAILED(hr)) {
             NXLOG_W("audio", "xaudio2: source voice Start failed (0x%08lx)", static_cast<unsigned long>(hr));
