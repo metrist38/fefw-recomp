@@ -143,6 +143,19 @@ struct AstcRateTracker {
     }
 };
 
+constexpr uint64_t kAstcMinTimedTexels = 65536;
+
+// Whole-row band height for a level larger than band_texels: a multiple of both the ASTC block height (bh) and BC's 4-row blocks,
+// rounded up so every full band has at least band_texels (>= kAstcMinTimedTexels) texels and stays eligible for GPU timing.
+inline uint32_t astc_band_rows(uint32_t width, uint32_t bh, uint64_t band_texels) {
+    if (!width || !bh) return 4;
+    uint32_t step = bh;
+    while (step % 4) step += bh;
+    const uint64_t min_rows = (band_texels + width - 1) / width;
+    const uint64_t steps = (min_rows + step - 1) / step;
+    return static_cast<uint32_t>(std::max<uint64_t>(step, steps * step));
+}
+
 // Any thread. True when the GPU path is on for this device. The first caller with wait builds the pipelines and runs the self-test (0.1 s
 // with the driver's shader cache, 1.4 to 2.3 s at a first start; background jobs call it so); without wait the answer is false until that
 // has happened (the render thread).

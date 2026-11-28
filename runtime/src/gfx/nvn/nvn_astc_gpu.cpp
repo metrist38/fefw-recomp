@@ -1086,9 +1086,7 @@ bool build_work(Texture* t, PreparedTexture& prep, gfx::Buffer& staged, Work& w)
     const uint32_t drop = tex_level_drop(t), levels = tex_levels(t);
     if (tex_layers(t) != prep.layers || tex_vk_format(t) != prep.format) return false;
     // a band is about 2 ms of GPU time at the measured rate, and whole rows of both block sizes (ASTC rows of bh texels, BC rows of 4)
-    const uint64_t band_texels = static_cast<uint64_t>(std::clamp(rate_now(w.j.kind) * 2.0, 65536.0, 4194304.0));
-    uint32_t step = w.j.bh;
-    while (step % 4) step += w.j.bh;
+    const uint64_t band_texels = static_cast<uint64_t>(std::clamp(rate_now(w.j.kind) * 2.0, static_cast<double>(kAstcMinTimedTexels), 4194304.0));
     w.texels = 0;
     for (uint32_t i = drop; i < prep.level.size() && i - drop < levels; ++i) {
         const PreparedLevel& pl = prep.level[i];
@@ -1109,7 +1107,7 @@ bool build_work(Texture* t, PreparedTexture& prep, gfx::Buffer& staged, Work& w)
                 w.j.rg.push_back(r);
             }
         } else {
-            const uint32_t rows = static_cast<uint32_t>(std::max<uint64_t>(step, band_texels / pl.width / step * step));
+            const uint32_t rows = astc_band_rows(pl.width, w.j.bh, band_texels);
             for (uint32_t l = 0; l < prep.layers; ++l)
                 for (uint32_t y = 0; y < pl.height; y += rows) {
                     Region r;
@@ -1309,7 +1307,7 @@ Pass run_work(Work& w, Frame& f, bool budgeted) {
                             s2.max_ms = ms;
                             if (ms > 4.0) NXLOG_I(kTag, "texture %u (%s): a pass of %.2f M texels took %.2f ms of GPU time (the longest so far)", tid, kind_name(kind), static_cast<double>(texels) / 1e6, ms);
                         }
-                        if (texels >= 65536 && ms > 0.0) {   // small ones time the fixed cost, not the rate
+                        if (texels >= kAstcMinTimedTexels && ms > 0.0) {   // small ones time the fixed cost, not the rate
                             const bool check = s2.is_auto && !s2.handoff.load();
                             const bool handoff = s2.rates.record(kind, static_cast<double>(texels) / ms, s2.slow, s2.handoff_ms, ft::now_ns(), kHandoffHoldNs, check);
                             s2.speed.store(s2.rates.cache_speed(s2.slow, kCacheRate), std::memory_order_relaxed);

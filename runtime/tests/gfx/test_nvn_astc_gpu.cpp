@@ -418,6 +418,34 @@ NXTEST(rate_tracker_separates_bc1_and_bc7) {
         CHECK(!off);
         CHECK_EQ(tr.cache_speed(1.0, cache_rate), 1);
     }
+    {   // Slow BC7 banded into minimum-size bands (e.g. 1024x1024 ASTC 6x6, 2048x2048 ASTC 10x10) must still reach record() and hand off
+        using nxrt::nvn::be::gpu::astc_band_rows;
+        using nxrt::nvn::be::gpu::kAstcMinTimedTexels;
+        const struct { uint32_t w, h, bh; } shapes[] = {
+            {1024, 1024, 6},
+            {2048, 2048, 6},
+            {2048, 2048, 10},
+            {1024, 1024, 12},
+        };
+        for (const auto& s : shapes) {
+            AstcRateTracker tr;
+            uint64_t t = sec;
+            bool off = false;
+            for (int tex = 0; tex < 10 && !off; ++tex) {
+                const uint64_t band_texels = static_cast<uint64_t>(std::clamp(tr.rate_now(AstcKind::Bc7, 1.0) * 2.0,
+                                                                              static_cast<double>(kAstcMinTimedTexels), 4194304.0));
+                const uint32_t rows = astc_band_rows(s.w, s.bh, band_texels);
+                CHECK_EQ(rows % 4, 0u);
+                CHECK_EQ(rows % s.bh, 0u);
+                CHECK(static_cast<uint64_t>(rows) * s.w >= kAstcMinTimedTexels);
+                for (uint32_t y = 0; y < s.h && !off; y += rows, t += sec / 10) {
+                    const uint64_t n = static_cast<uint64_t>(std::min(rows, s.h - y)) * s.w;
+                    if (n >= kAstcMinTimedTexels) off = tr.record(AstcKind::Bc7, rate(160.0), 1.0, limit, t, hold, true);
+                }
+            }
+            CHECK(off);
+        }
+    }
 }
 
 NXTEST(decode_to_rgba8_is_bit_exact) {
